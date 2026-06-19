@@ -89,6 +89,14 @@ class BaseStrategy(ABC):
         self._last_signal_time: Optional[datetime] = None
         self._bars: Dict[str, List[OHLCV]] = {}
     
+    # NSE F&O underlyings → NFO segment; BSE F&O underlyings → BFO segment
+    _NSE_UNDERLYINGS = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"}
+
+    def _sym(self, chain: "OptionChainSnapshot", strike: float, otype: str) -> str:
+        """Build a Fyers-compatible option symbol for any supported underlying."""
+        seg = "NFO" if chain.underlying in self._NSE_UNDERLYINGS else "BFO"
+        return f"{seg}:{chain.underlying}{chain.expiry}{int(strike)}{otype}"
+
     def parse_time(self, time_str: str) -> dt_time:
         """Parse time string to time object."""
         return datetime.strptime(time_str, "%H:%M:%S").time()
@@ -437,8 +445,11 @@ class FixedRR13Strategy(BaseStrategy):
         alpha2: float,
         e_diff: float
     ) -> Optional[StrategySignal]:
-        """Buy a slightly OTM call. SL=30%, Target=90% → 1:3 RR."""
-        strike = chain.atm_strike + 50
+        """Buy the first OTM call above ATM. SL=30%, Target=90% → 1:3 RR."""
+        above = sorted(k for k in chain.calls if k > chain.atm_strike)
+        if not above:
+            return None
+        strike = above[0]
         quote = chain.calls.get(strike)
         if not quote or not quote.ltp or quote.ltp < self.config.min_premium:
             return None
@@ -456,7 +467,7 @@ class FixedRR13Strategy(BaseStrategy):
             entry_price=entry,
             stop_loss=sl,
             target=target,
-            symbol=f"NFO:NIFTY{chain.expiry}{int(strike)}CE",
+            symbol=self._sym(chain, strike, "CE"),
             option_type=OptionType.CALL,
             strike=strike,
             expiry=chain.expiry,
@@ -470,8 +481,11 @@ class FixedRR13Strategy(BaseStrategy):
         alpha2: float,
         e_diff: float
     ) -> Optional[StrategySignal]:
-        """Buy a slightly OTM put. SL=30%, Target=90% → 1:3 RR."""
-        strike = chain.atm_strike - 50
+        """Buy the first OTM put below ATM. SL=30%, Target=90% → 1:3 RR."""
+        below = sorted((k for k in chain.puts if k < chain.atm_strike), reverse=True)
+        if not below:
+            return None
+        strike = below[0]
         quote = chain.puts.get(strike)
         if not quote or not quote.ltp or quote.ltp < self.config.min_premium:
             return None
@@ -488,7 +502,7 @@ class FixedRR13Strategy(BaseStrategy):
             entry_price=entry,
             stop_loss=sl,
             target=target,
-            symbol=f"NFO:NIFTY{chain.expiry}{int(strike)}PE",
+            symbol=self._sym(chain, strike, "PE"),
             option_type=OptionType.PUT,
             strike=strike,
             expiry=chain.expiry,
@@ -707,7 +721,7 @@ class CurvatureCreditSpreadStrategy(BaseStrategy):
         
         legs = [
             SpreadLeg(
-                symbol=f"NIFTY{chain.expiry}{sell_strike}PE",
+                symbol=self._sym(chain, sell_strike, "PE"),
                 strike=sell_strike,
                 option_type=OptionType.PUT,
                 direction=TransactionType.SELL,
@@ -715,7 +729,7 @@ class CurvatureCreditSpreadStrategy(BaseStrategy):
                 price=sell_quote.ltp
             ),
             SpreadLeg(
-                symbol=f"NIFTY{chain.expiry}{buy_strike}PE",
+                symbol=self._sym(chain, buy_strike, "PE"),
                 strike=buy_strike,
                 option_type=OptionType.PUT,
                 direction=TransactionType.BUY,
@@ -768,7 +782,7 @@ class CurvatureCreditSpreadStrategy(BaseStrategy):
         
         legs = [
             SpreadLeg(
-                symbol=f"NIFTY{chain.expiry}{sell_strike}CE",
+                symbol=self._sym(chain, sell_strike, "CE"),
                 strike=sell_strike,
                 option_type=OptionType.CALL,
                 direction=TransactionType.SELL,
@@ -776,7 +790,7 @@ class CurvatureCreditSpreadStrategy(BaseStrategy):
                 price=sell_quote.ltp
             ),
             SpreadLeg(
-                symbol=f"NIFTY{chain.expiry}{buy_strike}CE",
+                symbol=self._sym(chain, buy_strike, "CE"),
                 strike=buy_strike,
                 option_type=OptionType.CALL,
                 direction=TransactionType.BUY,
@@ -1027,33 +1041,33 @@ class SkewHunterStrategy(BaseStrategy):
         
         atm = chain.atm_strike
         
-        # Long Call trigger
+        # Long Call trigger — buy first OTM call (works for any strike interval)
         if (alpha1 > self.config.skewhunter_alpha1_long and
             alpha2 > self.config.skewhunter_alpha2_long):
-            
-            # Buy slightly OTM call
-            target_strike = atm + 50
-            quote = chain.calls.get(target_strike)
-            
-            if quote and quote.ltp >= self.config.min_premium:
-                return await self._create_long_signal(
-                    chain, quote, target_strike, OptionType.CALL,
-                    alpha1, alpha2
-                )
-        
-        # Long Put trigger
+
+            above = sorted(k for k in chain.calls if k > atm)
+            if above:
+                target_strike = above[0]
+                quote = chain.calls.get(target_strike)
+                if quote and quote.ltp >= self.config.min_premium:
+                    return await self._create_long_signal(
+                        chain, quote, target_strike, OptionType.CALL,
+                        alpha1, alpha2
+                    )
+
+        # Long Put trigger — buy first OTM put (works for any strike interval)
         elif (alpha1 < self.config.skewhunter_alpha1_short and
               alpha2 < self.config.skewhunter_alpha2_short):
-            
-            # Buy slightly OTM put
-            target_strike = atm - 50
-            quote = chain.puts.get(target_strike)
-            
-            if quote and quote.ltp >= self.config.min_premium:
-                return await self._create_long_signal(
-                    chain, quote, target_strike, OptionType.PUT,
-                    alpha1, alpha2
-                )
+
+            below = sorted((k for k in chain.puts if k < atm), reverse=True)
+            if below:
+                target_strike = below[0]
+                quote = chain.puts.get(target_strike)
+                if quote and quote.ltp >= self.config.min_premium:
+                    return await self._create_long_signal(
+                        chain, quote, target_strike, OptionType.PUT,
+                        alpha1, alpha2
+                    )
         
         return None
     
@@ -1074,7 +1088,7 @@ class SkewHunterStrategy(BaseStrategy):
         risk = entry_price - sl_price
         target_price = entry_price + 2 * risk
         
-        symbol = f"NIFTY{chain.expiry}{int(strike)}{option_type.value}"
+        symbol = self._sym(chain, strike, option_type.value)
         
         return StrategySignal(
             signal_type=SignalType.LONG,

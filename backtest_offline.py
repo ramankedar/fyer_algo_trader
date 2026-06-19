@@ -155,8 +155,15 @@ def generate_vix(trading_days: List[date], seed: int = 99) -> Dict[date, float]:
 
 class OfflineChainBuilder:
     """
-    Builds OptionChainSnapshot using BS model.
-    OI is a slow random walk so SkewHunter alpha1 (OI-change signal) is non-trivial.
+    Builds OptionChainSnapshot using BS model with a stochastic market-sentiment
+    state variable (_bias) that drives both the call/put skew slope ratio AND the
+    call/put volume imbalance each bar.  This is what makes alpha signals non-trivial:
+
+      _bias > 0  (bullish)  → OTM calls bid up, call vol > put vol
+      _bias < 0  (bearish)  → OTM puts bid up, put vol > call vol
+
+    _bias does a random walk ∈ [-3, 3] with step_size 0.04/bar.  At extreme
+    values it produces the IV and flow imbalances that cross alpha thresholds.
     """
 
     def __init__(self, bs: BlackScholesEngine, spec: InstrumentSpec, seed: int = 7) -> None:
@@ -164,6 +171,7 @@ class OfflineChainBuilder:
         self.spec   = spec
         self._rng   = np.random.default_rng(seed)
         self._oi:   Dict[str, float] = {}   # symbol → running OI
+        self._bias: float = 0.0             # market sentiment state
 
     def build(
         self,
@@ -190,53 +198,54 @@ class OfflineChainBuilder:
 
         pfx = f"{self.spec.segment}:{self.spec.name}"
 
-        # ── Skew model calibrated to real Nifty surface ───────────────────
-        # Absolute (not multiplicative) skew so nearby strikes show real diffs:
-        #   put_iv(K) = atm_iv + 0.0002 × (atm-K)  → 2pp per 100-pt OTM put wing
-        #   call_iv(K)= atm_iv + 0.00003 × (K-atm) → slight right-wing smile
-        #
-        # Add bar-level stochastic skew tilt so call/put balance varies:
-        #   skew_tilt ∈ [-0.008, +0.008] — simulates intraday flow imbalances
-        # This makes alpha signals non-degenerate.
-        skew_tilt = float(self._rng.normal(0, 0.004))   # OU-style daily tilt
+        # ── Stochastic sentiment state (slow random walk ∈ [-3, 3]) ─────────
+        # _bias drives BOTH the IV skew shape AND the volume imbalance:
+        #   +3 = maximum bullish: OTM calls become as expensive as OTM puts;
+        #         call volume dominates → FixedRR α2 ↑, SkewHunter α2 ↑
+        #   -3 = maximum fearful: OTM puts become very expensive;
+        #         put volume dominates → SkewHunter α2 ↓ (Long Put trigger)
+        self._bias += float(self._rng.normal(0, 0.04))
+        self._bias  = float(np.clip(self._bias, -3.0, 3.0))
 
-        # Bar-level call/put volume imbalance (drives FixedRR alpha2 vol_ratio)
-        # sentiment_bias: +1 = bullish (more call vol), -1 = bearish (more put vol)
-        if not hasattr(self, "_sentiment"):
-            self._sentiment = 0.0
-        self._sentiment += float(self._rng.normal(0, 0.05))  # slow random walk
-        self._sentiment  = float(np.clip(self._sentiment, -1.5, 1.5))
-        call_vol_mult = max(0.2, 1.0 + 0.4 * self._sentiment)
-        put_vol_mult  = max(0.2, 1.0 - 0.3 * self._sentiment)
+        # Slope of put/call wing (absolute IV per point OTM, calibrated to Nifty)
+        # Base: ATM-100 put ≈ +3pp above ATM (0.0003/pt), ATM+100 call ≈ +0.3pp
+        put_slope  = max(0.00005, 0.0003 * (1.0 - 0.18 * self._bias))
+        call_slope = max(0.00005, 0.0001 * (1.0 + 0.60 * self._bias))
 
-        # ─ Extend to ±25 strikes so FixedRR energy calc covers all moneyness ─
-        for i in range(-25, 26):
-            strike = atm + i * si
-            if strike <= 0:
-                continue
+        # Volume imbalance: which side has more activity this bar
+        call_vol_mult = max(0.15, 1.0 + 0.50 * self._bias)
+        put_vol_mult  = max(0.15, 1.0 - 0.35 * self._bias)
 
-            dk_put  = max(0.0, atm - strike)   # points OTM for a put
-            dk_call = max(0.0, strike - atm)   # points OTM for a call
+        # ── Vectorised BS over ±25 strikes ───────────────────────────────────
+        indices  = np.arange(-25, 26)
+        strikes  = atm + indices * si
+        valid    = strikes > 0
+        strikes  = strikes[valid]
+        indices  = indices[valid]
 
-            # Absolute skew + stochastic tilt
-            c_iv = max(0.04, atm_iv + 0.00003 * dk_call - skew_tilt)
-            p_iv = max(0.04, atm_iv + 0.00020 * dk_put  + skew_tilt)
+        dk_put   = np.maximum(0.0, atm - strikes)
+        dk_call  = np.maximum(0.0, strikes - atm)
+        c_iv_arr = np.maximum(0.04, atm_iv + call_slope * dk_call)
+        p_iv_arr = np.maximum(0.04, atm_iv + put_slope  * dk_put)
 
-            c_px = max(0.05, float(self.bs.call_price(spot, strike, tte, c_iv)))
-            p_px = max(0.05, float(self.bs.put_price(spot, strike, tte, p_iv)))
+        # BS price + delta in one numpy pass (no gamma/theta/vega — not used)
+        c_px_arr = np.maximum(0.05, self.bs.call_price(spot, strikes, tte, c_iv_arr))
+        p_px_arr = np.maximum(0.05, self.bs.put_price( spot, strikes, tte, p_iv_arr))
+        c_dl_arr = self.bs.delta(spot, strikes, tte, c_iv_arr, OptionType.CALL)
+        p_dl_arr = self.bs.delta(spot, strikes, tte, p_iv_arr, OptionType.PUT)
 
-            spread   = 0.004 + abs(i) * 0.001
-            # Volume drops away from ATM; random variation makes call/put different
-            v_base   = max(20, int(8_000 - abs(i) * 290))
-            c_vol    = max(10, int(v_base * call_vol_mult * float(self._rng.lognormal(0, 0.15))))
-            p_vol    = max(10, int(v_base * put_vol_mult  * float(self._rng.lognormal(0, 0.15))))
+        n_vol    = self._rng.lognormal(0, 0.15, size=(len(strikes), 2))
 
-            oi_base  = max(200, 80_000 - abs(i) * 2_800)
+        for idx_j, (i, strike) in enumerate(zip(indices, strikes)):
+            spread  = 0.004 + abs(i) * 0.001
+            v_base  = max(20, int(8_000 - abs(i) * 290))
+            c_vol   = max(10, int(v_base * call_vol_mult * n_vol[idx_j, 0]))
+            p_vol   = max(10, int(v_base * put_vol_mult  * n_vol[idx_j, 1]))
+            oi_base = max(200, 80_000 - int(abs(i) * 2_800))
 
             def _oi(key: str, base: int) -> int:
-                prev = self._oi.get(key, float(base))
-                # Larger OI swings near ATM (more active hedging)
-                swing = prev * (0.005 if abs(i) <= 3 else 0.002)
+                prev  = self._oi.get(key, float(base))
+                swing = prev * (0.006 if abs(i) <= 3 else 0.002)
                 new   = max(100.0, prev + float(self._rng.normal(0, swing)))
                 self._oi[key] = new
                 return int(new)
@@ -244,29 +253,25 @@ class OfflineChainBuilder:
             c_oi = _oi(f"{pfx}{exp_str}{int(strike)}CE", oi_base)
             p_oi = _oi(f"{pfx}{exp_str}{int(strike)}PE", oi_base)
 
-            def _q(otype: str, px: float, iv: float, oi: int, vol: int) -> OptionQuote:
-                opt = OptionType.CALL if otype == "CE" else OptionType.PUT
-                return OptionQuote(
-                    symbol      = f"{pfx}{exp_str}{int(strike)}{otype}",
-                    strike      = strike,
-                    expiry      = exp_str,
-                    option_type = opt,
-                    ltp         = round(px, 2),
-                    bid         = round(px * (1 - spread), 2),
-                    ask         = round(px * (1 + spread), 2),
-                    bid_qty     = vol,
-                    ask_qty     = vol,
-                    volume      = vol * 10,
-                    oi          = oi,
-                    iv          = iv,
-                    delta = float(self.bs.delta(spot, strike, tte, iv, opt)),
-                    gamma = float(self.bs.gamma(spot, strike, tte, iv)),
-                    theta = float(self.bs.theta(spot, strike, tte, iv, opt)),
-                    vega  = float(self.bs.vega(spot, strike, tte, iv)),
-                )
+            c_iv = float(c_iv_arr[idx_j]); p_iv = float(p_iv_arr[idx_j])
+            c_px = float(c_px_arr[idx_j]); p_px = float(p_px_arr[idx_j])
 
-            snap.calls[strike] = _q("CE", c_px, c_iv, c_oi, c_vol)
-            snap.puts[strike]  = _q("PE", p_px, p_iv, p_oi, p_vol)
+            snap.calls[float(strike)] = OptionQuote(
+                symbol=f"{pfx}{exp_str}{int(strike)}CE", strike=float(strike),
+                expiry=exp_str, option_type=OptionType.CALL,
+                ltp=round(c_px,2), bid=round(c_px*(1-spread),2),
+                ask=round(c_px*(1+spread),2),
+                bid_qty=c_vol, ask_qty=c_vol, volume=c_vol*10, oi=c_oi,
+                iv=c_iv, delta=float(c_dl_arr[idx_j]),
+            )
+            snap.puts[float(strike)] = OptionQuote(
+                symbol=f"{pfx}{exp_str}{int(strike)}PE", strike=float(strike),
+                expiry=exp_str, option_type=OptionType.PUT,
+                ltp=round(p_px,2), bid=round(p_px*(1-spread),2),
+                ask=round(p_px*(1+spread),2),
+                bid_qty=p_vol, ask_qty=p_vol, volume=p_vol*10, oi=p_oi,
+                iv=p_iv, delta=float(p_dl_arr[idx_j]),
+            )
 
         return snap
 

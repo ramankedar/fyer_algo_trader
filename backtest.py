@@ -167,50 +167,58 @@ class SyntheticChainBuilder:
             atm_strike=atm,
         )
 
-        for i in range(-10, 11):
-            strike = atm + i * si
-            if strike <= 0:
-                continue
+        if tte < 1e-6:
+            return snap
 
-            m_put  = max(0.0, (atm - strike) / spot)
-            m_call = max(0.0, (strike - atm) / spot)
-            call_iv = atm_iv * np.exp(0.30 * m_call)
-            put_iv  = atm_iv * np.exp(1.50 * m_put)
+        pfx = f"{self.spec.segment}:{self.spec.name}"
 
-            if tte < 1e-6:
-                continue
+        # Absolute skew calibrated to real Nifty surface
+        # (same model as OfflineChainBuilder so signal logic behaves consistently)
+        put_slope  = 0.0003   # 3pp per 100pt OTM put wing
+        call_slope = 0.00005  # 0.5pp per 100pt OTM call wing
 
-            call_px = max(0.05, float(self.bs.call_price(spot, strike, tte, call_iv)))
-            put_px  = max(0.05, float(self.bs.put_price(spot, strike, tte, put_iv)))
+        # ±25 strikes — necessary for FixedRR energy calc to cover all moneyness
+        indices  = np.arange(-25, 26)
+        strikes  = atm + indices * si
+        valid    = strikes > 0
+        strikes  = strikes[valid]
+        indices  = indices[valid]
 
-            spread   = 0.004 + abs(i) * 0.002
-            vol_base = max(50,    8_000 - abs(i) * 700)
-            oi_base  = max(500,  80_000 - abs(i) * 7_000)
-            pfx      = f"{self.spec.segment}:{self.spec.name}"
+        dk_put   = np.maximum(0.0, atm - strikes)
+        dk_call  = np.maximum(0.0, strikes - atm)
+        c_iv_arr = np.maximum(0.04, atm_iv + call_slope * dk_call)
+        p_iv_arr = np.maximum(0.04, atm_iv + put_slope  * dk_put)
 
-            def _make_quote(otype: str, px: float, iv: float) -> OptionQuote:
-                opt = OptionType.CALL if otype == "CE" else OptionType.PUT
-                return OptionQuote(
-                    symbol=f"{pfx}{exp_str}{int(strike)}{otype}",
-                    strike=strike,
-                    expiry=exp_str,
-                    option_type=opt,
-                    ltp=px,
-                    bid=round(px * (1 - spread), 2),
-                    ask=round(px * (1 + spread), 2),
-                    bid_qty=vol_base,
-                    ask_qty=vol_base,
-                    volume=vol_base * 10,
-                    oi=oi_base,
-                    iv=iv,
-                    delta=float(self.bs.delta(spot, strike, tte, iv, opt)),
-                    gamma=float(self.bs.gamma(spot, strike, tte, iv)),
-                    theta=float(self.bs.theta(spot, strike, tte, iv, opt)),
-                    vega=float(self.bs.vega(spot, strike, tte, iv)),
-                )
+        c_px_arr = np.maximum(0.05, self.bs.call_price(spot, strikes, tte, c_iv_arr))
+        p_px_arr = np.maximum(0.05, self.bs.put_price( spot, strikes, tte, p_iv_arr))
+        c_dl_arr = self.bs.delta(spot, strikes, tte, c_iv_arr, OptionType.CALL)
+        p_dl_arr = self.bs.delta(spot, strikes, tte, p_iv_arr, OptionType.PUT)
 
-            snap.calls[strike] = _make_quote("CE", call_px, call_iv)
-            snap.puts[strike]  = _make_quote("PE", put_px,  put_iv)
+        for j, (i, strike) in enumerate(zip(indices, strikes)):
+            spread   = 0.004 + abs(i) * 0.001
+            vol_base = max(50,   8_000 - abs(i) * 290)
+            oi_base  = max(500, 80_000 - abs(i) * 2_800)
+
+            snap.calls[float(strike)] = OptionQuote(
+                symbol=f"{pfx}{exp_str}{int(strike)}CE", strike=float(strike),
+                expiry=exp_str, option_type=OptionType.CALL,
+                ltp=round(float(c_px_arr[j]), 2),
+                bid=round(float(c_px_arr[j]) * (1 - spread), 2),
+                ask=round(float(c_px_arr[j]) * (1 + spread), 2),
+                bid_qty=vol_base, ask_qty=vol_base,
+                volume=vol_base * 10, oi=oi_base,
+                iv=float(c_iv_arr[j]), delta=float(c_dl_arr[j]),
+            )
+            snap.puts[float(strike)] = OptionQuote(
+                symbol=f"{pfx}{exp_str}{int(strike)}PE", strike=float(strike),
+                expiry=exp_str, option_type=OptionType.PUT,
+                ltp=round(float(p_px_arr[j]), 2),
+                bid=round(float(p_px_arr[j]) * (1 - spread), 2),
+                ask=round(float(p_px_arr[j]) * (1 + spread), 2),
+                bid_qty=vol_base, ask_qty=vol_base,
+                volume=vol_base * 10, oi=oi_base,
+                iv=float(p_iv_arr[j]), delta=float(p_dl_arr[j]),
+            )
 
         return snap
 
@@ -334,8 +342,8 @@ def generate_report(
     db: TradingDatabase,
     initial_capital: float,
     output_csv: str,
-) -> None:
-    """Read closed trades from DB and print metrics + save CSV."""
+    label: str = "",
+) -> dict:
     conn = db._get_connection()
     rows = conn.execute(
         """SELECT * FROM trades
@@ -345,7 +353,8 @@ def generate_report(
 
     if not rows:
         print("\n  No completed trades to report.\n")
-        return
+        return {}
+
 
     pnls  = [r["pnl"] for r in rows if r["pnl"] is not None]
     wins  = [p for p in pnls if p > 0]
@@ -409,6 +418,17 @@ def generate_report(
             writer.writerow({k: r[k] for k in fields})
     print(f"\n  Full trade log → {output_csv}\n")
 
+    return {
+        "label": label or output_csv,
+        "total_pnl": total_pnl,
+        "trades": len(pnls),
+        "win_rate": win_rate,
+        "profit_factor": pf,
+        "max_dd": max_dd,
+        "return_pct": total_pnl / initial_capital * 100,
+        "expectancy": expectancy,
+    }
+
 
 # ── Main Backtest Engine ──────────────────────────────────────────────────────
 
@@ -468,10 +488,10 @@ async def run_backtest(
     strat_skew     = SkewHunterStrategy(cfg, bs, db, risk, broker)
     all_strategies = [strat_fixed, strat_curv, strat_skew]
 
-    # Monkey-patch is_trading_window: BacktestEngine controls entry windows,
-    # so we disable the internal time check (which would use real wall-clock time).
+    # Monkey-patch time checks: BacktestEngine controls windows via bar_time.
     for s in all_strategies:
-        s.is_trading_window = lambda: True  # type: ignore[method-assign]
+        s.is_trading_window = lambda: True          # type: ignore[method-assign]
+    strat_curv.is_entry_window = lambda: True       # type: ignore[method-assign]
 
     # Time window constants
     T_OPEN        = dt_time(9, 15)
@@ -562,7 +582,8 @@ async def run_backtest(
                   f"pnl=₹{stats['realized_pnl']:+10,.0f}")
 
     print(f"\n  Processed {total_bars:,} bars across {trading_days} trading days")
-    generate_report(db, initial_capital, output_csv)
+    lbl = f"{spec.display_name}  ({trading_days} days, real Fyers data)"
+    return generate_report(db, initial_capital, output_csv, label=lbl)
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
