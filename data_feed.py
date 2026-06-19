@@ -419,26 +419,24 @@ class WebSocketFeed:
             return False
         
         try:
-            for symbol in symbols:
-                if self.broker_type == BrokerType.FYERS:
-                    message = {
-                        "T": "SUB_DATA",
-                        "L": "1",
-                        "SLIST": [symbol]
-                    }
-                else:  # Dhan format
-                    message = {
-                        "RequestCode": 15,
-                        "InstrumentCount": len(symbols),
-                        "InstrumentList": [
-                            {"ExchangeSegment": "NSE_FNO", "SecurityId": s}
-                            for s in symbols
-                        ]
-                    }
-                
+            if self.broker_type == BrokerType.FYERS:
+                # Send all symbols in one message; L=2 = Quote mode (LTP + bid/ask)
+                message = {"T": "SUB_DATA", "L": "2", "SLIST": symbols}
                 await self._ws.send(json.dumps(message))
-                self._subscribed_symbols.add(symbol)
-            
+            else:  # Dhan
+                message = {
+                    "RequestCode": 15,
+                    "InstrumentCount": len(symbols),
+                    "InstrumentList": [
+                        {"ExchangeSegment": "NSE_FNO", "SecurityId": s}
+                        for s in symbols
+                    ],
+                }
+                await self._ws.send(json.dumps(message))
+
+            for s in symbols:
+                self._subscribed_symbols.add(s)
+
             logger.info(f"Subscribed to {len(symbols)} symbols")
             return True
             
@@ -476,18 +474,36 @@ class WebSocketFeed:
             return False
     
     def _parse_fyers_tick(self, data: dict) -> Optional[Tick]:
-        """Parse Fyers WebSocket tick."""
+        """Parse Fyers v3 WebSocket tick.
+
+        Fyers v3 wraps tick fields inside a nested 'v' object:
+          {"symbol": "NFO:NIFTY...", "v": {"lp": 150.0, "bp": 149.9, "sp": 150.1, ...}}
+
+        Field mapping (Fyers names → our Tick fields):
+          lp  = last price (ltp)
+          bp  = best bid price
+          sp  = best ask price
+          bq  = best bid quantity
+          sq  = best ask quantity
+        """
         try:
+            symbol = data.get("symbol", "")
+            if not symbol:
+                return None
+            v = data.get("v", data)  # fall back to flat structure if no 'v' key
+            ltp = v.get("lp", v.get("ltp", 0.0))
+            if not ltp:
+                return None
             return Tick(
-                symbol=data.get("symbol", ""),
-                ltp=data.get("ltp", 0),
-                bid=data.get("bid", 0),
-                ask=data.get("ask", 0),
-                bid_qty=data.get("bidQty", 0),
-                ask_qty=data.get("askQty", 0),
-                volume=data.get("volume", 0),
-                oi=data.get("oi", 0),
-                timestamp=datetime.now()
+                symbol=symbol,
+                ltp=float(ltp),
+                bid=float(v.get("bp", v.get("bid", 0.0))),
+                ask=float(v.get("sp", v.get("ask", 0.0))),
+                bid_qty=int(v.get("bq", v.get("bidQty", 0))),
+                ask_qty=int(v.get("sq", v.get("askQty", 0))),
+                volume=int(v.get("volume", 0)),
+                oi=int(v.get("oi", 0)),
+                timestamp=datetime.now(),
             )
         except Exception as e:
             logger.debug(f"Failed to parse Fyers tick: {e}")
@@ -530,13 +546,18 @@ class WebSocketFeed:
                 )
                 
                 tick = None
-                
+
                 if isinstance(message, bytes):
                     if self.broker_type == BrokerType.DHAN:
                         tick = self._parse_dhan_tick(message)
+                    elif self.broker_type == BrokerType.FYERS:
+                        # Fyers v3 occasionally sends bytes; try JSON decode first
+                        try:
+                            tick = self._parse_fyers_tick(json.loads(message.decode()))
+                        except Exception:
+                            pass  # binary Fyers format not yet decoded
                 else:
                     data = json.loads(message)
-                    
                     if self.broker_type == BrokerType.FYERS:
                         tick = self._parse_fyers_tick(data)
                 

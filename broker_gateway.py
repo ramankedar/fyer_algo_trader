@@ -149,10 +149,12 @@ class BrokerGateway(ABC):
 
 class FyersGateway(BrokerGateway):
     """Fyers API v3 integration."""
-    
-    AUTH_BASE_URL = "[api-t1.fyers.in](https://api-t1.fyers.in/api/v3)"
-    DATA_URL = "[api-t2.fyers.in](https://api-t2.fyers.in/data)"
-    
+
+    # Fyers v3 session-based login endpoints (no browser required)
+    VAGATOR_URL = "https://api-t2.fyers.in/vagator/v2"
+    AUTH_BASE_URL = "https://api-t1.fyers.in/api/v3"
+    DATA_URL = "https://api-t2.fyers.in/data"
+
     def __init__(
         self,
         config: BrokerConfig,
@@ -160,7 +162,7 @@ class FyersGateway(BrokerGateway):
     ):
         super().__init__(config, compliance)
         self._refresh_token: Optional[str] = None
-    
+
     async def _get_client(self) -> httpx.AsyncClient:
         """Get or create HTTP client."""
         if self._client is None:
@@ -169,68 +171,142 @@ class FyersGateway(BrokerGateway):
                 headers={"Content-Type": "application/json"}
             )
         return self._client
-    
-    def _generate_auth_code_hash(self, auth_code: str) -> str:
-        """Generate SHA256 hash for authentication."""
-        data = f"{self.config.app_id}:{self.config.secret_key}"
-        return hashlib.sha256(data.encode()).hexdigest()
-    
+
+    def _app_id_hash(self, auth_code: str) -> str:
+        """SHA-256 of '<app_id>:<secret_key>' for token exchange."""
+        return hashlib.sha256(
+            f"{self.config.app_id}:{self.config.secret_key}".encode()
+        ).hexdigest()
+
+    def _pin_hash(self, pin: str) -> str:
+        """SHA-256 of the 4-digit Fyers PIN (required by verify_pin)."""
+        return hashlib.sha256(pin.encode()).hexdigest()
+
     async def authenticate(self) -> bool:
         """
-        Authenticate with Fyers using TOTP.
-        This is a simplified flow - actual implementation requires
-        handling the OAuth redirect flow.
+        Fyers API v3 automated login (no browser).
+
+        Flow:
+          1. send_login_otp  → request_key
+          2. verify_otp      → request_key  (uses TOTP)
+          3. verify_pin      → session token
+          4. generate-authcode → auth_code
+          5. validate-authcode → access_token
         """
+        if not self.config.pin:
+            logger.error("BROKER_PIN is required for Fyers authentication")
+            return False
+
+        client = await self._get_client()
+
         try:
-            client = await self._get_client()
-            
-            # Step 1: Generate auth code URL
-            # In production, this would involve browser redirect
-            logger.info("Starting Fyers authentication flow")
-            
-            # Get TOTP code
-            totp_code = self.compliance.get_totp_code()
+            # ── Step 1: Initiate login, get request_key ──────────────────
+            logger.info("Fyers auth step 1: send_login_otp")
+            r = await client.post(
+                f"{self.VAGATOR_URL}/send_login_otp",
+                json={"fy_id": self.config.client_id, "app_id": "2"},
+            )
+            data = r.json()
+            if data.get("s") != "ok" or not data.get("request_key"):
+                logger.error(f"send_login_otp failed: {data}")
+                return False
+            request_key = data["request_key"]
+
+            # ── Step 2: Verify TOTP ──────────────────────────────────────
+            logger.info("Fyers auth step 2: verify_otp (TOTP)")
+            totp_code = await self.compliance.get_totp_code_async()
             if not totp_code:
                 logger.error("Failed to get TOTP code")
                 return False
-            
-            # Step 2: Validate TOTP and get auth code
-            # Note: Actual Fyers flow requires interactive login
-            # This is a placeholder for the token validation
-            
-            validate_url = f"{self.AUTH_BASE_URL}/validate-authcode"
-            
-            app_id_hash = self._generate_auth_code_hash("")
-            
-            payload = {
-                "grant_type": "authorization_code",
-                "appIdHash": app_id_hash,
-                "code": totp_code  # This would be the auth_code from redirect
-            }
-            
-            response = await client.post(validate_url, json=payload)
-            
-            if response.status_code == 200:
-                data = response.json()
-                if data.get("s") == "ok":
-                    self._session_token = data.get("access_token")
-                    self._refresh_token = data.get("refresh_token")
-                    self.compliance.set_session(self._session_token)
-                    logger.info("Fyers authentication successful")
-                    return True
-            
-            logger.error(f"Fyers authentication failed: {response.text}")
+
+            r = await client.post(
+                f"{self.VAGATOR_URL}/verify_otp",
+                json={"request_key": request_key, "otp": totp_code},
+            )
+            data = r.json()
+            if data.get("s") != "ok" or not data.get("request_key"):
+                logger.error(f"verify_otp failed: {data}")
+                return False
+            request_key = data["request_key"]
+
+            # ── Step 3: Verify PIN → session token ───────────────────────
+            logger.info("Fyers auth step 3: verify_pin")
+            r = await client.post(
+                f"{self.VAGATOR_URL}/verify_pin",
+                json={
+                    "request_key": request_key,
+                    "identity_type": "pin",
+                    "recaptcha_token": "",
+                    "pin": self._pin_hash(self.config.pin),
+                },
+            )
+            data = r.json()
+            session_token = (data.get("data") or {}).get("token")
+            if not session_token:
+                logger.error(f"verify_pin failed: {data}")
+                return False
+
+            # ── Step 4: Generate auth code ───────────────────────────────
+            logger.info("Fyers auth step 4: generate-authcode")
+            r = await client.post(
+                f"{self.AUTH_BASE_URL}/generate-authcode",
+                headers={"Authorization": session_token},
+                json={
+                    "fyers_id": self.config.client_id,
+                    "app_id": self.config.app_id,
+                    "redirect_uri": self.config.redirect_uri,
+                    "appType": "100",
+                    "code_challenge": "",
+                    "state": "None",
+                    "scope": "",
+                    "nonce": "",
+                    "response_type": "code",
+                    "create_cookie": True,
+                },
+            )
+            data = r.json()
+            redirect_url: str = data.get("Url", "")
+            if not redirect_url or "auth_code=" not in redirect_url:
+                logger.error(f"generate-authcode failed: {data}")
+                return False
+
+            # Parse auth_code from redirect URL query string
+            from urllib.parse import urlparse, parse_qs
+            auth_code = parse_qs(urlparse(redirect_url).query).get("auth_code", [None])[0]
+            if not auth_code:
+                logger.error(f"auth_code not found in redirect URL: {redirect_url}")
+                return False
+
+            # ── Step 5: Exchange auth_code for access_token ──────────────
+            logger.info("Fyers auth step 5: validate-authcode")
+            r = await client.post(
+                f"{self.AUTH_BASE_URL}/validate-authcode",
+                json={
+                    "grant_type": "authorization_code",
+                    "appIdHash": self._app_id_hash(auth_code),
+                    "code": auth_code,
+                },
+            )
+            data = r.json()
+            if data.get("s") == "ok" and data.get("access_token"):
+                self._session_token = data["access_token"]
+                self._refresh_token = data.get("refresh_token")
+                self.compliance.set_session(self._session_token)
+                logger.info("Fyers authentication successful")
+                return True
+
+            logger.error(f"validate-authcode failed: {data}")
             return False
-            
+
         except Exception as e:
             logger.error(f"Fyers authentication error: {e}")
             return False
     
     def _get_auth_headers(self) -> dict:
-        """Get authorization headers."""
+        """Fyers v3 authorization header format: '<app_id>:<access_token>'."""
         return {
             "Authorization": f"{self.config.app_id}:{self._session_token}",
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
         }
     
     def _format_symbol(

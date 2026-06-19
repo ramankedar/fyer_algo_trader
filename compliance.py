@@ -210,9 +210,9 @@ class IPValidator:
     """
     
     PUBLIC_IP_SERVICES = [
-        "[api.ipify.org](https://api.ipify.org)",
-        "[ifconfig.me](https://ifconfig.me/ip)",
-        "[icanhazip.com](https://icanhazip.com)",
+        "https://api.ipify.org",
+        "https://ifconfig.me/ip",
+        "https://icanhazip.com",
     ]
     
     def __init__(self, whitelisted_ip: str, enable_check: bool = True):
@@ -343,20 +343,24 @@ class TOTPAuthenticator:
         return self.totp.verify(code)
     
     def wait_for_fresh_code(self, min_validity: int = 5) -> str:
-        """
-        Wait for a code with at least min_validity seconds remaining.
-        Prevents submitting codes that are about to expire.
-        """
+        """Blocking wait for a TOTP code with at least min_validity seconds remaining."""
         while True:
             code, remaining = self.get_code_with_validity()
-            
             if remaining >= min_validity:
                 return code
-            
-            # Wait for next code
             wait_time = remaining + 1
             logger.debug(f"Waiting {wait_time}s for fresh TOTP code")
             time.sleep(wait_time)
+
+    async def wait_for_fresh_code_async(self, min_validity: int = 5) -> str:
+        """Async wait for a TOTP code with at least min_validity seconds remaining."""
+        while True:
+            code, remaining = self.get_code_with_validity()
+            if remaining >= min_validity:
+                return code
+            wait_time = remaining + 1
+            logger.debug(f"Waiting {wait_time}s for fresh TOTP code (async)")
+            await asyncio.sleep(wait_time)
 
 
 class DailyLoginManager:
@@ -497,9 +501,15 @@ class ComplianceManager:
         return await self.rate_limiter.acquire_async(segment, timeout)
     
     def get_totp_code(self) -> Optional[str]:
-        """Get TOTP code for authentication."""
+        """Get TOTP code for authentication (blocking)."""
         if self.totp:
             return self.totp.wait_for_fresh_code()
+        return None
+
+    async def get_totp_code_async(self) -> Optional[str]:
+        """Get TOTP code for authentication (non-blocking async)."""
+        if self.totp:
+            return await self.totp.wait_for_fresh_code_async()
         return None
     
     def set_session(self, token: str, expiry: Optional[datetime] = None) -> None:

@@ -77,19 +77,20 @@ class BrokerConfig:
     app_id: str
     secret_key: str
     totp_key: str
-    redirect_uri: str = "[127.0.0.1](https://127.0.0.1:8080/callback)"
+    pin: str = ""
+    redirect_uri: str = "https://127.0.0.1:8080/callback"
     api_base_url: str = ""
     ws_url: str = ""
-    
+
     def __post_init__(self):
         if self.broker_type == BrokerType.FYERS:
-            self.api_base_url = "[api-t1.fyers.in](https://api-t1.fyers.in/api/v3)"
+            self.api_base_url = "https://api-t1.fyers.in/api/v3"
             self.ws_url = "wss://api-t1.fyers.in/socket/v2/dataSock"
         elif self.broker_type == BrokerType.DHAN:
-            self.api_base_url = "[api.dhan.co](https://api.dhan.co/v2)"
+            self.api_base_url = "https://api.dhan.co/v2"
             self.ws_url = "wss://api-feed.dhan.co"
         elif self.broker_type == BrokerType.OPENALGO:
-            self.api_base_url = os.getenv("OPENALGO_API_URL", "[127.0.0.1](http://127.0.0.1:5000)")
+            self.api_base_url = os.getenv("OPENALGO_API_URL", "http://127.0.0.1:5000")
             self.ws_url = os.getenv("OPENALGO_WS_URL", "ws://127.0.0.1:5000/ws")
 
 @dataclass
@@ -164,6 +165,8 @@ class AppConfig:
         app_id=os.getenv("BROKER_APP_ID", ""),
         secret_key=os.getenv("BROKER_SECRET_KEY", ""),
         totp_key=os.getenv("BROKER_TOTP_KEY", ""),
+        pin=os.getenv("BROKER_PIN", ""),
+        redirect_uri=os.getenv("BROKER_REDIRECT_URI", "https://127.0.0.1:8080/callback"),
     ))
     risk: RiskConfig = field(default_factory=RiskConfig)
     compliance: ComplianceConfig = field(default_factory=lambda: ComplianceConfig(

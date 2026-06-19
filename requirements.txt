@@ -4,6 +4,7 @@ scipy>=1.10.0
 httpx>=0.24.0
 websockets>=11.0
 pyotp>=2.8.0
+dotenv>=1.0.0
 
 # Database
 # SQLite is built into Python - no additional package needed

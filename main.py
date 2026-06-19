@@ -8,7 +8,7 @@ import asyncio
 import signal
 import sys
 import logging
-from datetime import datetime, time as dt_time
+from datetime import datetime, timedelta, time as dt_time
 from typing import Optional, List, Dict
 
 from config import (
@@ -56,6 +56,9 @@ class TradingEngine:
         self._running = False
         self._shutdown_event = asyncio.Event()
         self._tasks: List[asyncio.Task] = []
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        # WS tick LTP cache: symbol → last known LTP (avoids HTTP polling)
+        self._tick_ltp: Dict[str, float] = {}
     
     async def initialize(self) -> bool:
         """Initialize all trading components."""
@@ -171,54 +174,91 @@ class TradingEngine:
         
         self.logger.info(f"Initialized {len(self.strategies)} strategies")
     
+    # ── Expiry / TTE helpers ──────────────────────────────────────────────────
+
+    def _get_nearest_weekly_expiry(self) -> datetime:
+        """Return the next NSE weekly expiry (Thursday). If today is Thursday
+        and market has closed, roll to next week."""
+        today = datetime.now()
+        days_ahead = (3 - today.weekday()) % 7  # 3 = Thursday
+        if days_ahead == 0 and today.time() >= dt_time(15, 30):
+            days_ahead = 7
+        return today + timedelta(days=days_ahead)
+
+    def _expiry_key(self) -> str:
+        """Canonical expiry string used as the chain-manager dict key.
+        Format: DDMMMYY  e.g. '19JUN25'.  Used consistently everywhere."""
+        return self._get_nearest_weekly_expiry().strftime("%d%b%y").upper()
+
+    def _compute_tte(self, expiry_dt: datetime) -> float:
+        """Time-to-expiry in years counting only Mon-Fri trading days."""
+        now = datetime.now()
+        current = now
+        trading_days = 0.0
+        while current.date() < expiry_dt.date():
+            if current.weekday() < 5:
+                trading_days += 1
+            current += timedelta(days=1)
+        # Fractional day: fraction of 6h15m NSE session remaining today
+        if expiry_dt.date() >= now.date() and now.weekday() < 5:
+            session_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
+            session_open  = now.replace(hour=9,  minute=15, second=0, microsecond=0)
+            if now < session_close:
+                elapsed = max(0, (now - session_open).total_seconds())
+                session_len = (session_close - session_open).total_seconds()
+                trading_days += max(0.0, 1.0 - elapsed / session_len)
+        return max(1 / 252, trading_days / 252)
+
+    # ── Tick handling ─────────────────────────────────────────────────────────
+
     def _on_tick(self, tick: Tick) -> None:
         """Handle incoming tick data."""
         try:
+            # Always cache LTP for position monitor (avoids HTTP polling)
+            self._tick_ltp[tick.symbol] = tick.ltp
+
             # Update bar aggregator
-            completed_bar = self.bar_aggregator.process_tick(tick)
-            
+            self.bar_aggregator.process_tick(tick)
+
             # Update chain manager if option tick
             if "CE" in tick.symbol or "PE" in tick.symbol:
                 self._update_option_chain(tick)
-            
+
             # Update spot price
-            if tick.symbol == f"{self.config.underlying_symbol}-EQ":
+            if tick.symbol.endswith(f"{self.config.underlying_symbol}-EQ") or \
+               tick.symbol == self.config.underlying_symbol:
                 self.chain_manager.update_spot(tick.ltp)
-                
+
         except Exception as e:
             self.logger.error(f"Tick processing error: {e}")
     
     def _update_option_chain(self, tick: Tick) -> None:
-        """Update option chain from tick."""
+        """Update option chain from tick data."""
         try:
-            # Parse option symbol (e.g., NIFTY24JUN23000CE)
             symbol = tick.symbol
-            
-            # Extract components (simplified parsing)
-            option_type = OptionType.CALL if "CE" in symbol else OptionType.PUT
-            
-            # Extract strike (last 5 digits before CE/PE typically)
+            option_type = OptionType.CALL if symbol.endswith("CE") else OptionType.PUT
+            suffix = "CE" if option_type == OptionType.CALL else "PE"
+
+            # Strip exchange prefix e.g. "NFO:" → bare symbol
+            bare = symbol.split(":")[-1]
+
+            # Extract numeric strike from the end: everything before CE/PE suffix
+            bare_no_suffix = bare[:-2]  # remove "CE" or "PE"
             strike_str = ""
-            for i in range(len(symbol) - 2, 0, -1):
-                if symbol[i].isdigit():
-                    strike_str = symbol[i] + strike_str
+            for ch in reversed(bare_no_suffix):
+                if ch.isdigit():
+                    strike_str = ch + strike_str
                 else:
                     break
-            
             if not strike_str:
                 return
-            
             strike = float(strike_str)
-            
-            # Extract expiry (between underlying and strike)
-            # This is simplified - actual parsing depends on symbol format
-            expiry = datetime.now().strftime("%d%b%Y").upper()
-            
-            # Calculate time to expiry
-            # Simplified: assume weekly expiry
-            days_to_expiry = 7  # Would need proper expiry calendar
-            time_to_expiry = days_to_expiry / 365
-            
+
+            # Use the canonical expiry key (same format used in _subscribe_symbols)
+            expiry = self._expiry_key()
+            expiry_dt = self._get_nearest_weekly_expiry()
+            time_to_expiry = self._compute_tte(expiry_dt)
+
             self.chain_manager.update_option_quote(
                 symbol=symbol,
                 strike=strike,
@@ -231,9 +271,9 @@ class TradingEngine:
                 ask_qty=tick.ask_qty,
                 volume=tick.volume,
                 oi=tick.oi,
-                time_to_expiry=time_to_expiry
+                time_to_expiry=time_to_expiry,
             )
-            
+
         except Exception as e:
             self.logger.debug(f"Option chain update error: {e}")
     
@@ -244,12 +284,19 @@ class TradingEngine:
             strategy.update_bar(bar)
     
     def _handle_risk_event(self, event: RiskEvent, data: Dict) -> None:
-        """Handle risk management events."""
+        """Handle risk management events.
+
+        This may be called from a threading.Lock context inside RiskManager,
+        so we must never call asyncio.create_task() directly here.
+        Instead, schedule the coroutine onto the event loop thread-safely.
+        """
         self.logger.warning(f"Risk event: {event.value}, data: {data}")
-        
         if event in (RiskEvent.MAX_DRAWDOWN, RiskEvent.DAILY_LOSS_LIMIT):
-            # Trigger emergency shutdown
-            asyncio.create_task(self._emergency_shutdown(event.value))
+            if self._loop and self._loop.is_running():
+                ev_val = event.value
+                self._loop.call_soon_threadsafe(
+                    lambda: self._loop.create_task(self._emergency_shutdown(ev_val))
+                )
     
     async def _emergency_shutdown(self, reason: str) -> None:
         """Execute emergency shutdown."""
@@ -286,8 +333,8 @@ class TradingEngine:
                     await asyncio.sleep(60)
                     continue
                 
-                # Get current option chain
-                expiry = datetime.now().strftime("%d%b%Y").upper()
+                # Get current option chain — use the same key as _update_option_chain
+                expiry = self._expiry_key()
                 chain = self.chain_manager.get_chain(expiry)
                 
                 if not chain or chain.spot_price <= 0:
@@ -343,77 +390,83 @@ class TradingEngine:
         self.logger.info("Strategy loop stopped")
     
     async def _position_monitor_loop(self) -> None:
-        """Monitor positions for SL/TP triggers."""
+        """Monitor positions for SL/TP triggers.
+
+        Reads LTP from the WebSocket tick cache (_tick_ltp) so we never burn
+        the SEBI 9-OPS rate limit on HTTP quote polling.
+        Falls back to a broker REST call only when the symbol is missing from
+        the cache (e.g. a freshly subscribed symbol with no tick yet).
+        """
         self.logger.info("Position monitor started")
-        
+
         while self._running:
             try:
-                # Update position prices
-                positions = self.risk_manager.get_positions()
-                
-                for position in positions:
-                    quote = await self.broker.get_quote(
-                        position.symbol,
-                        Exchange.NFO
-                    )
-                    
-                    if quote:
-                        event = self.risk_manager.update_price(
-                            position.trade_id,
-                            quote.ltp
-                        )
-                        
+                for position in self.risk_manager.get_positions():
+                    ltp = self._tick_ltp.get(position.symbol)
+
+                    if ltp is None:
+                        # One-time REST fallback — cache the result immediately
+                        quote = await self.broker.get_quote(position.symbol, Exchange.NFO)
+                        if quote:
+                            ltp = quote.ltp
+                            self._tick_ltp[position.symbol] = ltp
+
+                    if ltp is not None:
+                        event = self.risk_manager.update_price(position.trade_id, ltp)
                         if event:
                             self.logger.info(
-                                f"Position event: {position.symbol}, "
-                                f"event={event.value}"
+                                f"Position event: {position.symbol} event={event.value}"
                             )
-                
-                await asyncio.sleep(0.5)  # 500ms monitoring cycle
-                
+
+                await asyncio.sleep(0.5)
+
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 self.logger.error(f"Position monitor error: {e}")
                 await asyncio.sleep(1)
-        
+
         self.logger.info("Position monitor stopped")
     
     async def _subscribe_symbols(self) -> None:
-        """Subscribe to required symbols."""
-        # Get current expiry symbols
-        expiry = datetime.now().strftime("%y%b").upper()
-        
-        # Generate symbol list
-        symbols = [
-            f"NSE:{self.config.underlying_symbol}-EQ",  # Spot
-        ]
-        
-        # Add option strikes around ATM
+        """Subscribe to Nifty spot + options around ATM for the nearest weekly expiry."""
+        # Canonical expiry string — must match what _update_option_chain uses
+        expiry = self._expiry_key()          # e.g. "19JUN25"
+        expiry_dt = self._get_nearest_weekly_expiry()
+
+        # Fyers weekly option symbol format: NFO:NIFTY{YY}{M}{DD}{strike}CE
+        # where M is single digit for months 1-9, or O/N/D for Oct/Nov/Dec
+        month_map = {10: "O", 11: "N", 12: "D"}
+        m = expiry_dt.month
+        month_char = month_map.get(m, str(m))
+        yy = expiry_dt.strftime("%y")
+        dd = expiry_dt.strftime("%d")
+        fyers_expiry = f"{yy}{month_char}{dd}"   # e.g. "2561​9"
+
+        symbols = [f"NSE:{self.config.underlying_symbol}50-INDEX"]  # Nifty spot
+
         spot_quote = await self.broker.get_quote(
-            f"{self.config.underlying_symbol}-EQ",
-            Exchange.NSE
+            f"{self.config.underlying_symbol}50-INDEX", Exchange.NSE
         )
-        
         if spot_quote:
             atm = round(spot_quote.ltp / 50) * 50
-            
-            for offset in [-200, -150, -100, -50, 0, 50, 100, 150, 200]:
+            und = self.config.underlying_symbol  # "NIFTY"
+            for offset in range(-200, 250, 50):
                 strike = int(atm + offset)
-                symbols.append(f"NFO:{self.config.underlying_symbol}{expiry}{strike}CE")
-                symbols.append(f"NFO:{self.config.underlying_symbol}{expiry}{strike}PE")
-        
-        self.logger.info(f"Subscribing to {len(symbols)} symbols")
+                symbols.append(f"NFO:{und}{fyers_expiry}{strike}CE")
+                symbols.append(f"NFO:{und}{fyers_expiry}{strike}PE")
+
+        self.logger.info(f"Subscribing to {len(symbols)} symbols (expiry={expiry})")
         await self.ws_feed.subscribe(symbols)
     
     async def run(self) -> None:
         """Run the trading engine."""
         self._running = True
-        
+        self._loop = asyncio.get_running_loop()  # stored for thread-safe scheduling
+
         # Setup signal handlers
-        loop = asyncio.get_event_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, self._signal_handler)
+            self._loop.add_signal_handler(sig, self._signal_handler)
         
         try:
             # Initialize WebSocket feed
