@@ -228,32 +228,32 @@ class RiskManager:
     
     def _check_risk_limits(self) -> Optional[RiskEvent]:
         """Check if any risk limits are breached."""
-        # Check daily loss limit
-        if self._metrics.daily_loss_percent >= self.thresholds.max_daily_loss_percent:
+        # Use > with a tiny epsilon to avoid float boundary noise (e.g. 2.000001% >= 2%)
+        eps = 1e-9
+
+        if self._metrics.daily_loss_percent > self.thresholds.max_daily_loss_percent + eps:
             logger.warning(
                 f"Daily loss limit breached: {self._metrics.daily_loss_percent:.2f}% "
-                f">= {self.thresholds.max_daily_loss_percent}%"
+                f"> {self.thresholds.max_daily_loss_percent}%"
             )
             return RiskEvent.DAILY_LOSS_LIMIT
-        
-        # Check max drawdown
+
         drawdown_percent = self._metrics.max_drawdown / self.capital * 100
-        if drawdown_percent >= self.thresholds.max_drawdown_percent:
+        if drawdown_percent > self.thresholds.max_drawdown_percent + eps:
             logger.warning(
                 f"Max drawdown breached: {drawdown_percent:.2f}% "
-                f">= {self.thresholds.max_drawdown_percent}%"
+                f"> {self.thresholds.max_drawdown_percent}%"
             )
             return RiskEvent.MAX_DRAWDOWN
-        
-        # Check trailing drawdown
+
         trailing_dd_percent = self._metrics.current_drawdown / self.capital * 100
-        if trailing_dd_percent >= self.thresholds.trailing_drawdown_percent:
+        if trailing_dd_percent > self.thresholds.trailing_drawdown_percent + eps:
             logger.warning(
                 f"Trailing drawdown breached: {trailing_dd_percent:.2f}% "
-                f">= {self.thresholds.trailing_drawdown_percent}%"
+                f"> {self.thresholds.trailing_drawdown_percent}%"
             )
             return RiskEvent.MAX_DRAWDOWN
-        
+
         return None
     
     def remove_position(self, trade_id: str, exit_pnl: float) -> None:
@@ -272,22 +272,32 @@ class RiskManager:
         """
         if self._metrics.is_locked:
             return False, f"Trading locked: {self._metrics.lock_reason}"
-        
+
         if self._is_emergency_mode:
             return False, "System in emergency mode"
-        
+
         if self.db.is_trading_locked():
             return False, "Trading locked in database"
-        
+
+        # Block re-entry once today's daily loss limit has been reached.
+        # Without this, the system loops: daily-limit fires → exit → re-enter
+        # → limit fires again immediately, generating hundreds of micro-trades.
+        if self._metrics.daily_loss_percent >= self.thresholds.max_daily_loss_percent:
+            return False, (
+                f"Daily loss limit reached "
+                f"({self._metrics.daily_loss_percent:.2f}% "
+                f">= {self.thresholds.max_daily_loss_percent}%)"
+            )
+
         # Check position count
         if self._metrics.open_positions >= self.thresholds.max_open_positions:
             return False, f"Max positions reached: {self.thresholds.max_open_positions}"
-        
-        # Check if already in drawdown
+
+        # Check if already near trailing drawdown limit
         drawdown_pct = self._metrics.current_drawdown / self.capital * 100
         if drawdown_pct >= self.thresholds.trailing_drawdown_percent * 0.8:
             return False, f"Near drawdown limit: {drawdown_pct:.2f}%"
-        
+
         return True, "OK"
     
     def calculate_position_size(
@@ -404,6 +414,13 @@ class RiskManager:
                 lock_reason=self._metrics.lock_reason
             )
     
+    def update_trailing_stop(self, trade_id: str, new_stop: float) -> None:
+        """Raise the stop-loss for a winning long position (trailing stop)."""
+        with self._lock:
+            pos = self._positions.get(trade_id)
+            if pos and pos.direction == "BUY" and new_stop > pos.stop_loss:
+                pos.stop_loss = new_stop
+
     def get_positions(self) -> List[PositionState]:
         """Get all current positions."""
         with self._lock:

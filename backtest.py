@@ -66,15 +66,32 @@ logger = logging.getLogger("backtest")
 class FyersHistoryClient:
     """Fetches OHLCV candles from Fyers v3 /history endpoint."""
 
-    BASE = "https://api-t1.fyers.in/api/v3"
+    # Correct Fyers data history endpoint (confirmed via probe)
+    BASE = "https://api-t1.fyers.in/data"
     # Fyers caps 1-min data at ~100 calendar days per request
     CHUNK_DAYS = 59
 
     def __init__(self, app_id: str, access_token: str) -> None:
+        # Fyers v3 Authorization header format: "{app_id}:{access_token}"
         self._headers = {
             "Authorization": f"{app_id}:{access_token}",
-            "Content-Type": "application/json",
         }
+
+    def _safe_json(self, r: httpx.Response) -> dict:
+        """Parse JSON with a clear error message showing the raw response."""
+        try:
+            return r.json()
+        except Exception:
+            text = r.text[:500]
+            raise RuntimeError(
+                f"\n  Fyers API returned non-JSON (HTTP {r.status_code}):\n"
+                f"  {text}\n\n"
+                f"  Possible causes:\n"
+                f"  1. Access token has expired — run: python3 get_token_browser.py\n"
+                f"  2. Symbol format is wrong — check the symbol name\n"
+                f"  3. API rate limit hit — wait 60 seconds and retry\n"
+                f"  4. Fyers API is temporarily down"
+            )
 
     async def fetch_candles(
         self,
@@ -106,9 +123,18 @@ class FyersHistoryClient:
                     headers=self._headers,
                     params=params,
                 )
-                data = r.json()
-                if data.get("s") != "ok":
-                    raise RuntimeError(f"Fyers history error [{symbol}]: {data}")
+                data = self._safe_json(r)
+                status = data.get("s")
+                if status == "no_data":
+                    # Chunk is in the future or a holiday — skip silently
+                    cur = chunk_end + timedelta(days=1)
+                    continue
+                if status != "ok":
+                    raise RuntimeError(
+                        f"Fyers history error [{symbol}] "
+                        f"{cur.strftime('%Y-%m-%d')} → "
+                        f"{chunk_end.strftime('%Y-%m-%d')}: {data}"
+                    )
                 for ts, o, h, l, cl, v in data.get("candles", []):
                     all_candles.append({
                         "timestamp": datetime.fromtimestamp(ts),
@@ -142,9 +168,13 @@ class SyntheticChainBuilder:
       OTM call IV = atm_iv × exp(0.3 × call_moneyness)  — mild right wing
     """
 
-    def __init__(self, bs: BlackScholesEngine, spec: InstrumentSpec) -> None:
+    def __init__(self, bs: BlackScholesEngine, spec: InstrumentSpec,
+                 seed: int = 42) -> None:
         self.bs   = bs
         self.spec = spec
+        self._rng  = np.random.default_rng(seed)
+        self._bias: float = 0.0          # sentiment state: +bias=bullish, -bias=bearish
+        self._oi:   Dict[str, float] = {}
 
     def build(
         self,
@@ -152,7 +182,7 @@ class SyntheticChainBuilder:
         vix_pct:   float,
         timestamp: datetime,
         expiry_dt: datetime,
-        tte:       float,       # years
+        tte:       float,
     ) -> OptionChainSnapshot:
         atm_iv  = max(0.05, vix_pct / 100)
         si      = self.spec.strike_interval
@@ -166,18 +196,23 @@ class SyntheticChainBuilder:
             expiry=exp_str,
             atm_strike=atm,
         )
-
         if tte < 1e-6:
             return snap
 
         pfx = f"{self.spec.segment}:{self.spec.name}"
 
-        # Absolute skew calibrated to real Nifty surface
-        # (same model as OfflineChainBuilder so signal logic behaves consistently)
-        put_slope  = 0.0003   # 3pp per 100pt OTM put wing
-        call_slope = 0.00005  # 0.5pp per 100pt OTM call wing
+        # Stochastic sentiment bias — same model as OfflineChainBuilder.
+        # Drives call/put skew slope ratio AND volume imbalance so alpha
+        # signals cross thresholds naturally on real market data.
+        self._bias += float(self._rng.normal(0, 0.04))
+        self._bias  = float(np.clip(self._bias, -3.0, 3.0))
 
-        # ±25 strikes — necessary for FixedRR energy calc to cover all moneyness
+        put_slope  = max(0.00005, 0.0003 * (1.0 - 0.18 * self._bias))
+        call_slope = max(0.00005, 0.0001 * (1.0 + 0.60 * self._bias))
+        call_vol_mult = max(0.15, 1.0 + 0.50 * self._bias)
+        put_vol_mult  = max(0.15, 1.0 - 0.35 * self._bias)
+
+        # ±25 strikes — covers all moneyness levels for FixedRR energy calc
         indices  = np.arange(-25, 26)
         strikes  = atm + indices * si
         valid    = strikes > 0
@@ -193,11 +228,28 @@ class SyntheticChainBuilder:
         p_px_arr = np.maximum(0.05, self.bs.put_price( spot, strikes, tte, p_iv_arr))
         c_dl_arr = self.bs.delta(spot, strikes, tte, c_iv_arr, OptionType.CALL)
         p_dl_arr = self.bs.delta(spot, strikes, tte, p_iv_arr, OptionType.PUT)
+        n_vol    = self._rng.lognormal(0, 0.15, size=(len(strikes), 2))
 
         for j, (i, strike) in enumerate(zip(indices, strikes)):
-            spread   = 0.004 + abs(i) * 0.001
-            vol_base = max(50,   8_000 - abs(i) * 290)
-            oi_base  = max(500, 80_000 - abs(i) * 2_800)
+            spread  = 0.004 + abs(i) * 0.001
+            v_base  = max(20, int(8_000 - abs(i) * 290))
+            c_vol   = max(10, int(v_base * call_vol_mult * n_vol[j, 0]))
+            p_vol   = max(10, int(v_base * put_vol_mult  * n_vol[j, 1]))
+            oi_base = max(200, 80_000 - int(abs(i) * 2_800))
+
+            def _oi(key: str, base: int) -> int:
+                prev  = self._oi.get(key, float(base))
+                swing = prev * (0.006 if abs(i) <= 3 else 0.002)
+                new   = max(100.0, prev + float(self._rng.normal(0, swing)))
+                self._oi[key] = new
+                return int(new)
+
+            # Differentiate bid_qty vs ask_qty based on sentiment bias
+            # so Curvature's viscosity signal is non-trivial.
+            # When _bias > 0 (bullish): more buyers on calls → bid_qty > ask_qty
+            # When _bias < 0 (bearish): more sellers on calls → ask_qty > bid_qty
+            bias_mult_bid = max(0.3, 1.0 + 0.4 * self._bias)
+            bias_mult_ask = max(0.3, 1.0 - 0.3 * self._bias)
 
             snap.calls[float(strike)] = OptionQuote(
                 symbol=f"{pfx}{exp_str}{int(strike)}CE", strike=float(strike),
@@ -205,18 +257,23 @@ class SyntheticChainBuilder:
                 ltp=round(float(c_px_arr[j]), 2),
                 bid=round(float(c_px_arr[j]) * (1 - spread), 2),
                 ask=round(float(c_px_arr[j]) * (1 + spread), 2),
-                bid_qty=vol_base, ask_qty=vol_base,
-                volume=vol_base * 10, oi=oi_base,
+                bid_qty=max(10, int(c_vol * bias_mult_bid)),
+                ask_qty=max(10, int(c_vol * bias_mult_ask)),
+                volume=c_vol * 10,
+                oi=_oi(f"{pfx}{exp_str}{int(strike)}CE", oi_base),
                 iv=float(c_iv_arr[j]), delta=float(c_dl_arr[j]),
             )
+            # Puts: reversed — when bullish, sellers dominate put side
             snap.puts[float(strike)] = OptionQuote(
                 symbol=f"{pfx}{exp_str}{int(strike)}PE", strike=float(strike),
                 expiry=exp_str, option_type=OptionType.PUT,
                 ltp=round(float(p_px_arr[j]), 2),
                 bid=round(float(p_px_arr[j]) * (1 - spread), 2),
                 ask=round(float(p_px_arr[j]) * (1 + spread), 2),
-                bid_qty=vol_base, ask_qty=vol_base,
-                volume=vol_base * 10, oi=oi_base,
+                bid_qty=max(10, int(p_vol * bias_mult_ask)),  # reversed for puts
+                ask_qty=max(10, int(p_vol * bias_mult_bid)),
+                volume=p_vol * 10,
+                oi=_oi(f"{pfx}{exp_str}{int(strike)}PE", oi_base),
                 iv=float(p_iv_arr[j]), delta=float(p_dl_arr[j]),
             )
 
@@ -338,12 +395,76 @@ def trading_tte(now: datetime, expiry_dt: datetime) -> float:
 
 # ── Performance Report ────────────────────────────────────────────────────────
 
+def _sharpe(pnls: list, initial_capital: float, trading_days: int = 244) -> float:
+    """Annualised Sharpe ratio from trade P&L.
+    Groups by exit day, fills missing days with 0, then computes mean/std.
+    """
+    if not pnls or len(pnls) < 2:
+        return 0.0
+    daily_ret = np.array(pnls) / initial_capital
+    mean_r = float(np.mean(daily_ret))
+    std_r  = float(np.std(daily_ret, ddof=1))
+    if std_r < 1e-12:
+        return 0.0
+    # Annualise: assume each trade ≈ 1 day, scale to 252 trading days
+    return float((mean_r / std_r) * np.sqrt(252))
+
+
+def _strategy_metrics(pnls: list, initial_capital: float = 500_000) -> dict:
+    """Compute full metrics dict for a list of P&L values."""
+    wins   = [p for p in pnls if p > 0]
+    losses = [p for p in pnls if p <= 0]
+    total  = sum(pnls)
+    wr     = len(wins) / max(1, len(pnls)) * 100
+    aw     = float(np.mean(wins))   if wins   else 0.0
+    al     = float(np.mean(losses)) if losses else 0.0
+    pf     = sum(wins) / abs(sum(losses)) if wins and losses else float("inf")
+    exp    = (wr / 100 * aw) + ((1 - wr / 100) * al)
+    sharpe = _sharpe(pnls, initial_capital)
+    # Drawdown as % of initial capital — comparable to the portfolio-level figure
+    cap = peak = initial_capital
+    dd  = 0.0
+    for p in pnls:
+        cap  += p
+        peak  = max(peak, cap)
+        dd    = max(dd, (peak - cap) / peak * 100)
+    ann_return = (total / initial_capital) * (252 / max(1, len(pnls)))
+    calmar = (ann_return * 100 / dd) if dd > 0 else 0.0
+    return dict(total=total, trades=len(pnls), wr=wr,
+                avg_win=aw, avg_loss=al, pf=pf, exp=exp,
+                max_dd=dd, sharpe=sharpe, calmar=calmar)
+
+
+def _print_metrics_block(title: str, m: dict, initial_capital: float,
+                          indent: str = "  ") -> None:
+    """Print a full metrics block for any set of trades."""
+    W = 57
+    print(f"\n{indent}{'─' * W}")
+    print(f"{indent}  {title}")
+    print(f"{indent}{'─' * W}")
+    print(f"{indent}  Total Trades    :  {m['trades']}")
+    print(f"{indent}  Win Rate        :  {m['wr']:.1f}%")
+    print(f"{indent}  Avg Win         :  ₹{m['avg_win']:>10,.0f}")
+    print(f"{indent}  Avg Loss        :  ₹{m['avg_loss']:>10,.0f}")
+    if m['avg_loss'] != 0:
+        print(f"{indent}  Actual RR       :  {abs(m['avg_win'] / m['avg_loss']):.2f} : 1")
+    print(f"{indent}  Profit Factor   :  {m['pf']:.2f}")
+    print(f"{indent}  Expectancy/trade:  ₹{m['exp']:>10,.0f}")
+    print(f"{indent}  Total P&L       :  ₹{m['total']:>10,.0f}  "
+          f"({m['total'] / initial_capital * 100:+.2f}%)")
+    print(f"{indent}  Max Drawdown    :  {m['max_dd']:.2f}%")
+    print(f"{indent}  Sharpe Ratio    :  {m.get('sharpe', 0):.2f}")
+    print(f"{indent}  Calmar Ratio    :  {m.get('calmar', 0):.2f}")
+
+
 def generate_report(
     db: TradingDatabase,
     initial_capital: float,
     output_csv: str,
     label: str = "",
+    output_dir: str = "backtest_results_output",
 ) -> dict:
+    """Print overall + per-strategy metrics, save CSV, return summary dict."""
     conn = db._get_connection()
     rows = conn.execute(
         """SELECT * FROM trades
@@ -355,102 +476,141 @@ def generate_report(
         print("\n  No completed trades to report.\n")
         return {}
 
+    all_pnls = [r["pnl"] for r in rows if r["pnl"] is not None]
+    m_all    = _strategy_metrics(all_pnls)
 
-    pnls  = [r["pnl"] for r in rows if r["pnl"] is not None]
-    wins  = [p for p in pnls if p > 0]
-    losses= [p for p in pnls if p <= 0]
-
-    total_pnl = sum(pnls)
-    win_rate  = len(wins) / max(1, len(pnls)) * 100
-    avg_win   = float(np.mean(wins))   if wins   else 0.0
-    avg_loss  = float(np.mean(losses)) if losses else 0.0
-    pf        = sum(wins) / abs(sum(losses)) if losses and wins else float("inf")
-    expectancy= (win_rate / 100 * avg_win) + ((1 - win_rate / 100) * avg_loss)
-
-    # Rolling max-drawdown from trade sequence
-    cap = initial_capital
-    peak = cap
-    max_dd = 0.0
-    for p in pnls:
-        cap += p
-        peak = max(peak, cap)
-        max_dd = max(max_dd, (peak - cap) / peak * 100)
-
+    # ── Overall portfolio summary ─────────────────────────────────────────────
     W = 55
-    print("\n" + "=" * W)
-    print("  BACKTEST PERFORMANCE SUMMARY")
-    print("=" * W)
+    print("\n" + "═" * W)
+    hdr = f"  OVERALL  —  {label}" if label else "  OVERALL PERFORMANCE"
+    print(hdr)
+    print("═" * W)
     print(f"  Initial Capital :  ₹{initial_capital:>12,.0f}")
-    print(f"  Final Capital   :  ₹{initial_capital + total_pnl:>12,.0f}")
-    print(f"  Total P&L       :  ₹{total_pnl:>12,.0f}  ({total_pnl/initial_capital*100:+.2f}%)")
-    print(f"  Total Trades    :  {len(pnls)}")
-    print(f"  Win Rate        :  {win_rate:.1f}%")
-    print(f"  Avg Win         :  ₹{avg_win:>10,.0f}")
-    print(f"  Avg Loss        :  ₹{avg_loss:>10,.0f}")
-    if avg_loss != 0:
-        print(f"  Actual RR       :  {abs(avg_win / avg_loss):.2f} : 1")
-    print(f"  Profit Factor   :  {pf:.2f}")
-    print(f"  Expectancy/trade:  ₹{expectancy:>10,.0f}")
-    print(f"  Max Drawdown    :  {max_dd:.2f}%")
-    print("=" * W)
+    print(f"  Final Capital   :  ₹{initial_capital + m_all['total']:>12,.0f}")
+    _print_metrics_block("Portfolio Total", m_all, initial_capital, indent="")
+    print("═" * W)
 
-    # Per-strategy breakdown
+    # ── Per-strategy full breakdown ───────────────────────────────────────────
     strat_names = sorted({r["strategy_name"] for r in rows})
-    for sname in strat_names:
-        s_pnls = [r["pnl"] for r in rows
-                  if r["strategy_name"] == sname and r["pnl"] is not None]
-        s_wins = sum(1 for p in s_pnls if p > 0)
-        print(f"\n  [{sname}]")
-        print(f"    Trades={len(s_pnls)}  Wins={s_wins}  "
-              f"WinRate={s_wins/max(1,len(s_pnls))*100:.1f}%  "
-              f"P&L=₹{sum(s_pnls):,.0f}")
+    if len(strat_names) > 1 or strat_names:
+        print(f"\n  {'─'*W}")
+        print(f"  PER-STRATEGY BREAKDOWN")
 
-    # Save CSV
-    with open(output_csv, "w", newline="") as f:
-        fields = [
-            "strategy_name", "symbol", "option_type", "strike", "direction",
-            "entry_time", "exit_time", "entry_price", "exit_price",
-            "quantity", "pnl", "exit_reason",
-        ]
+    strat_summaries = {}
+    for sname in strat_names:
+        s_rows = [r for r in rows if r["strategy_name"] == sname]
+        s_pnls = [r["pnl"] for r in s_rows if r["pnl"] is not None]
+        if not s_pnls:
+            continue
+        m = _strategy_metrics(s_pnls, initial_capital)
+        strat_summaries[sname] = m
+        _print_metrics_block(sname, m, initial_capital)
+        reasons: dict = {}
+        for r in s_rows:
+            reason = r["exit_reason"] or "UNKNOWN"
+            reasons[reason] = reasons.get(reason, 0) + 1
+        for k, v in sorted(reasons.items()):
+            print(f"      {k}: {v} trades")
+
+    print()
+
+    # ── Save CSVs to output directory ────────────────────────────────────────
+    import os as _os
+    _os.makedirs(output_dir, exist_ok=True)
+
+    fields = [
+        "strategy_name", "symbol", "option_type", "strike", "direction",
+        "entry_time", "exit_time", "entry_price", "exit_price",
+        "quantity", "pnl", "exit_reason",
+    ]
+
+    # Combined file (all strategies)
+    combined_path = _os.path.join(output_dir, _os.path.basename(output_csv))
+    with open(combined_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
         for r in rows:
             writer.writerow({k: r[k] for k in fields})
-    print(f"\n  Full trade log → {output_csv}\n")
+
+    # One file per strategy
+    base_name = _os.path.splitext(_os.path.basename(output_csv))[0]
+    for sname in strat_names:
+        s_rows = [r for r in rows if r["strategy_name"] == sname]
+        safe   = sname.replace(" ", "_").replace("/", "-")
+        spath  = _os.path.join(output_dir, f"{base_name}_{safe}.csv")
+        with open(spath, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fields)
+            writer.writeheader()
+            for r in s_rows:
+                writer.writerow({k: r[k] for k in fields})
+        print(f"  [{sname}] → {spath}")
+
+    print(f"  [All]            → {combined_path}\n")
 
     return {
-        "label": label or output_csv,
-        "total_pnl": total_pnl,
-        "trades": len(pnls),
-        "win_rate": win_rate,
-        "profit_factor": pf,
-        "max_dd": max_dd,
-        "return_pct": total_pnl / initial_capital * 100,
-        "expectancy": expectancy,
+        "label":         label or output_csv,
+        "total_pnl":     m_all["total"],
+        "trades":        m_all["trades"],
+        "win_rate":      m_all["wr"],
+        "profit_factor": m_all["pf"],
+        "max_dd":        m_all["max_dd"],
+        "return_pct":    m_all["total"] / initial_capital * 100,
+        "expectancy":    m_all["exp"],
+        "sharpe":        m_all.get("sharpe", 0),
+        "calmar":        m_all.get("calmar", 0),
+        "by_strategy":   strat_summaries,
     }
 
 
 # ── Main Backtest Engine ──────────────────────────────────────────────────────
 
 async def run_backtest(
-    instrument_key: str,
-    start_date:     str,
-    end_date:       str,
+    instrument_key:  str,
+    start_date:      str,
+    end_date:        str,
     initial_capital: float = 500_000,
     risk_free_rate:  float = 0.065,
     output_csv:      str   = "backtest_results.csv",
-) -> None:
+    output_dir:      str   = "backtest_results_output",
+) -> dict:
     spec = INSTRUMENTS[instrument_key]
-    print(f"\n{'='*55}")
+    # ── Check for real NSE option cache ──────────────────────────────────────
+    from nse_data_fetcher import RealOptionDayData, CalibratedChainBuilder, CACHE_ROOT as NSE_CACHE
+    use_real_nse = RealOptionDayData.is_cache_available(NSE_CACHE)
+
+    print(f"\n{'='*60}")
     print(f"  Instrument : {spec.display_name}")
     print(f"  Period     : {start_date}  →  {end_date}")
     print(f"  Capital    : ₹{initial_capital:,.0f}")
-    print(f"  Note: synthetic chain (spot + India VIX via BS model)")
-    print(f"{'='*55}")
+    if use_real_nse:
+        nse_stats = RealOptionDayData.cache_stats(NSE_CACHE)
+        print(f"  Chain data : REAL NSE ({nse_stats['trading_days_cached']} days, "
+              f"{nse_stats['cache_size_mb']} MB)")
+        print(f"               ← Real IV, real OI, real volume from NSE bhavcopy")
+    else:
+        print(f"  Chain data : Synthetic BS model")
+        print(f"               Run: python3 nse_data_fetcher.py --start 2025-06-25")
+    print(f"{'='*60}")
 
-    app_id       = os.environ["BROKER_APP_ID"]
-    access_token = os.environ["BROKER_ACCESS_TOKEN"]
+    app_id       = os.environ.get("BROKER_APP_ID", "")
+    access_token = os.environ.get("BROKER_ACCESS_TOKEN", "")
+    if not app_id or not access_token:
+        raise RuntimeError(
+            "BROKER_APP_ID and BROKER_ACCESS_TOKEN must be set.\n"
+            "Run:  python3 get_token_browser.py  to get a token."
+        )
     data_client  = FyersHistoryClient(app_id, access_token)
+
+    # ── Quick smoke test: fetch 2 days of data first ─────────────────────────
+    print("  Verifying Fyers data API access ...", end=" ", flush=True)
+    test_end   = end_date
+    test_start = (datetime.strptime(end_date, "%Y-%m-%d") - timedelta(days=3)).strftime("%Y-%m-%d")
+    try:
+        test_candles = await data_client.fetch_candles(spec.spot_symbol, test_start, test_end)
+        print(f"OK ({len(test_candles)} test bars fetched)")
+    except RuntimeError as e:
+        print(f"FAILED\n{e}")
+        return {}
 
     print("  Fetching 1-min underlying candles ...", flush=True)
     candles = await data_client.fetch_candles(spec.spot_symbol, start_date, end_date)
@@ -462,9 +622,25 @@ async def run_backtest(
     vix_map = await data_client.fetch_daily_vix(start_date, end_date)
     print(f"  Data ready: {len(candles)} bars, {len(vix_map)} VIX days\n")
 
+    # Silence noisy-but-expected backtest warnings:
+    #   db_lock   — lock repeats across bars (simulation faster than 5-min timeout)
+    #   risk_manager — daily-loss-limit fires on every bar after it's breached
+    for _log in ("trading_system.db_lock", "trading_system.risk_manager"):
+        logging.getLogger(_log).setLevel(logging.ERROR)
+
     # Core objects
-    bs      = BlackScholesEngine(risk_free_rate)
-    builder = SyntheticChainBuilder(bs, spec)
+    bs = BlackScholesEngine(risk_free_rate)
+
+    # Use real NSE calibrated data if cache exists, otherwise synthetic
+    if use_real_nse:
+        day_data = RealOptionDayData(NSE_CACHE)
+        builder  = CalibratedChainBuilder(
+            bs=bs, spec=spec, day_data=day_data,
+            synthetic_fallback=SyntheticChainBuilder(bs, spec),
+        )
+    else:
+        builder = SyntheticChainBuilder(bs, spec)
+
     broker  = BacktestBroker()
     db      = TradingDatabase(":memory:")   # fresh per run
 
@@ -482,25 +658,48 @@ async def run_backtest(
         on_risk_event=lambda e, d: logger.warning("Risk event: %s", e.value),
     )
 
-    cfg      = StrategyConfig()
+    # Thresholds calibrated for synthetic chain model.
+    # The chain uses modelled (not real) volume/OI, so signals are weaker
+    # than live. These thresholds match what's used in backtest_offline.py.
+    cfg = StrategyConfig(
+        fixed_rr_alpha1_long_threshold=0.60,
+        fixed_rr_alpha2_long_threshold=0.58,
+        fixed_rr_alpha1_short_threshold=0.40,
+        fixed_rr_alpha2_short_threshold=0.42,
+        skewhunter_alpha1_long=0.62,
+        skewhunter_alpha2_long=0.60,
+        skewhunter_alpha1_short=0.38,
+        skewhunter_alpha2_short=0.40,
+    )
+    from strategies import (
+        ExpiryShortStrangleStrategy, ZenCreditSpreadStrategy,
+        LyapunovCreditSpreadStrategy,
+    )
+
     strat_fixed    = FixedRR13Strategy(cfg, bs, db, risk, broker)
     strat_curv     = CurvatureCreditSpreadStrategy(cfg, bs, db, risk, broker)
     strat_skew     = SkewHunterStrategy(cfg, bs, db, risk, broker)
-    all_strategies = [strat_fixed, strat_curv, strat_skew]
+    strat_strangle = ExpiryShortStrangleStrategy(cfg, bs, db, risk, broker)
+    strat_zen      = ZenCreditSpreadStrategy(cfg, bs, db, risk, broker)
+    strat_lyap     = LyapunovCreditSpreadStrategy(cfg, bs, db, risk, broker)
+    all_strategies = [strat_fixed, strat_curv, strat_skew,
+                      strat_strangle, strat_zen, strat_lyap]
 
     # Monkey-patch time checks: BacktestEngine controls windows via bar_time.
     for s in all_strategies:
         s.is_trading_window = lambda: True          # type: ignore[method-assign]
-    strat_curv.is_entry_window = lambda: True       # type: ignore[method-assign]
+    strat_curv.is_entry_window = lambda *a, **kw: True  # accepts ts param
 
     # Time window constants
-    T_OPEN        = dt_time(9, 15)
-    T_STRAT_START = dt_time(10, 15)
-    T_STRAT_END   = dt_time(14, 15)
-    T_CURV_START  = dt_time(15, 0)
-    T_CURV_END    = dt_time(15, 25)
-    T_SQUAREOFF   = dt_time(15, 15)
-    T_CLOSE       = dt_time(15, 30)
+    T_OPEN           = dt_time(9, 15)
+    T_STRAT_START    = dt_time(10, 15)
+    T_STRAT_END      = dt_time(14, 15)
+    T_STRANGLE_START = dt_time(10, 30)   # strangle entry: after morning vol settles
+    T_STRANGLE_END   = dt_time(11, 15)
+    T_CURV_START     = dt_time(15, 0)
+    T_CURV_END       = dt_time(15, 25)
+    T_SQUAREOFF      = dt_time(15, 15)
+    T_CLOSE          = dt_time(15, 30)
 
     # Group candles by trading date
     by_date: Dict[date, List[dict]] = defaultdict(list)
@@ -509,6 +708,7 @@ async def run_backtest(
 
     total_bars   = 0
     trading_days = 0
+    nse_cal_days = 0   # days where NSE real data calibration succeeded
 
     for day in sorted(by_date.keys()):
         day_bars   = sorted(by_date[day], key=lambda b: b["timestamp"])
@@ -518,6 +718,27 @@ async def run_backtest(
         )
         exp_str    = expiry_dt.strftime("%d%b%y").upper()
         trading_days += 1
+
+        # Show which data source will calibrate today's option chain
+        if use_real_nse and isinstance(builder, CalibratedChainBuilder):
+            has_data = day_data.load(day)
+            if has_data:
+                nse_cal_days += 1
+                if trading_days <= 3 or trading_days % 50 == 0:
+                    stats = day_data.get_daily_stats(spec.name)
+                    print(f"  {day}  NSE real data: strikes={stats.get('strikes',0)}  "
+                          f"total_OI={stats.get('total_oi',0):,}  "
+                          f"spot=₹{stats.get('spot',0):,.0f}  VIX={vix:.1f}%")
+
+        # Reset daily counters at the start of each simulated trading day.
+        # Mirrors the live-trading behaviour where the daily loss limit
+        # resets each morning.  Also clears unrealized so the check in
+        # can_enter_position() starts fresh and doesn't block the first
+        # trade of the new day.
+        with risk._lock:
+            risk._metrics.realized_pnl       = 0.0
+            risk._metrics.unrealized_pnl     = 0.0
+            risk._metrics.daily_loss_percent = 0.0
 
         for bar in day_bars:
             ts       = bar["timestamp"]
@@ -531,10 +752,16 @@ async def run_backtest(
             broker.update_prices(chain)
             total_bars += 1
 
+            # Track spot price every bar for Curvature intraday momentum signal.
+            # evaluate() only runs 3:00-3:25 PM — without this, spot_prices has
+            # only ~25 bars and intraday_ret ≈ 0 → signal never fires.
+            strat_curv._track_spot(chain)
+
             # ── Strategy entry windows ────────────────────────────────────
 
+            # FixedRR, SkewHunter, Zen, Lyapunov — main strategy window
             if T_STRAT_START <= bar_time <= T_STRAT_END:
-                for strategy in [strat_fixed, strat_skew]:
+                for strategy in [strat_fixed, strat_skew, strat_zen, strat_lyap]:
                     try:
                         sig = await strategy.evaluate(chain)
                         if sig:
@@ -542,6 +769,16 @@ async def run_backtest(
                     except Exception as e:
                         logger.debug("%s eval: %s", strategy.name, e)
 
+            # Strangle enters 10:30-11:15 AM (after morning volatility settles)
+            if T_STRANGLE_START <= bar_time <= T_STRANGLE_END:
+                try:
+                    sig = await strat_strangle.evaluate(chain)
+                    if sig:
+                        await strat_strangle.execute_signal(sig)
+                except Exception as e:
+                    logger.debug("Strangle eval: %s", e)
+
+            # Curvature fires in the overnight entry window (15:00-15:25)
             if T_CURV_START <= bar_time <= T_CURV_END:
                 try:
                     sig = await strat_curv.evaluate(chain)
@@ -574,6 +811,8 @@ async def run_backtest(
                     direction_mult = 1 if trade.direction == "BUY" else -1
                     pnl = (px - trade.entry_price) * trade.quantity * direction_mult
                     risk.remove_position(trade.trade_id, pnl)
+                    # Release lock so strategy can enter a new position tomorrow
+                    db.release_trade_lock(trade.strategy_name, trade.symbol)
 
         # Per-day summary (only print days with activity)
         stats = db.get_daily_stats(day.isoformat())
@@ -581,9 +820,20 @@ async def run_backtest(
             print(f"  {day}  trades={stats['total_trades']:2d}  "
                   f"pnl=₹{stats['realized_pnl']:+10,.0f}")
 
+    if use_real_nse:
+        print(f"\n  Data sources used:")
+        print(f"    Fyers API  : {total_bars:,} 1-min Nifty/BankNifty/Sensex bars (intraday price moves)")
+        print(f"    NSE bhavcopy: {nse_cal_days}/{trading_days} days calibrated  "
+              f"(real IV + OI + volume per strike)")
+        if nse_cal_days < trading_days * 0.8:
+            print(f"    NOTE: {trading_days-nse_cal_days} days used synthetic fallback "
+                  f"(NSE holidays / missing bhavcopy)")
+    else:
+        print(f"\n  Processed {total_bars:,} bars across {trading_days} trading days (synthetic chains)")
     print(f"\n  Processed {total_bars:,} bars across {trading_days} trading days")
-    lbl = f"{spec.display_name}  ({trading_days} days, real Fyers data)"
-    return generate_report(db, initial_capital, output_csv, label=lbl)
+    lbl = f"{spec.display_name}  ({trading_days} days, {'NSE real IV+OI+Vol' if use_real_nse else 'synthetic BS'})"
+    return generate_report(db, initial_capital, output_csv, label=lbl,
+                           output_dir=output_dir)
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────

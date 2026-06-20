@@ -62,77 +62,118 @@ VAGATOR = "https://api-t2.fyers.in/vagator/v2"
 API_V3  = "https://api-t1.fyers.in/api/v3"
 
 
-async def _fyers_login(
-    client_id:   str,
-    app_id:      str,
-    secret_key:  str,
-    totp_key:    str,
-    pin:         str,
-    redirect_uri: str,
+def _sha256(s: str) -> str:
+    return hashlib.sha256(s.encode()).hexdigest()
+
+
+async def _get_public_ip(client: httpx.AsyncClient) -> str:
+    """Fetch current public IP from multiple services."""
+    for url in ["https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com"]:
+        try:
+            r = await client.get(url, timeout=5)
+            if r.status_code == 200:
+                return r.text.strip()
+        except Exception:
+            continue
+    return "unknown"
+
+
+async def _do_steps_1_and_2(
+    c: httpx.AsyncClient,
+    client_id: str,
+    totp_key: str,
 ) -> Optional[str]:
-    """Run the 5-step Fyers automated login. Returns access_token or None."""
-    import pyotp
+    """Run steps 1+2 and return the request_key for step 3, or None on failure."""
+    import pyotp, time
 
-    def sha256(s: str) -> str:
-        return hashlib.sha256(s.encode()).hexdigest()
+    # Step 1 — send_login_otp
+    print("  [1/5] Sending login OTP ...", end=" ", flush=True)
+    r = await c.post(f"{VAGATOR}/send_login_otp",
+                     json={"fy_id": client_id, "app_id": "2"})
+    d = r.json()
+    if d.get("s") != "ok":
+        print(f"FAILED: {d}")
+        return None
+    rk = d["request_key"]
+    print("OK")
 
+    # Step 2 — verify_otp (TOTP)
+    print("  [2/5] Verifying TOTP ...", end=" ", flush=True)
     totp = pyotp.TOTP(totp_key.replace(" ", "").upper())
+    while True:
+        remaining = 30 - (int(time.time()) % 30)
+        if remaining >= 8:
+            break
+        print(f"(waiting {remaining}s for fresh TOTP)", end=" ", flush=True)
+        await asyncio.sleep(remaining + 1)
+    r = await c.post(f"{VAGATOR}/verify_otp",
+                     json={"request_key": rk, "otp": totp.now()})
+    d = r.json()
+    if d.get("s") != "ok":
+        print(f"FAILED: {d}")
+        return None
+    print("OK")
+    return d["request_key"]
 
+
+async def _fyers_login(
+    client_id:    str,
+    app_id:       str,
+    secret_key:   str,
+    totp_key:     str,
+    pin:          str,
+    redirect_uri: str,
+    current_ip:   str,
+) -> Optional[str]:
+    """
+    5-step Fyers headless login.  Returns access_token or None.
+
+    PIN handling:
+      Fyers requires SHA-256(pin) for the verify_pin call.
+      We try SHA-256 first (correct), then plain as a fallback.
+      IMPORTANT: each PIN attempt uses a fresh request_key because
+      Fyers invalidates the key on a failed attempt.
+    """
     async with httpx.AsyncClient(timeout=30) as c:
-        # Step 1 — send_login_otp
-        print("  [1/5] Sending login OTP ...", end=" ", flush=True)
-        r = await c.post(f"{VAGATOR}/send_login_otp",
-                         json={"fy_id": client_id, "app_id": "2"})
-        d = r.json()
-        if d.get("s") != "ok":
-            print(f"FAILED: {d}")
-            return None
-        rk = d["request_key"]
-        print("OK")
 
-        # Step 2 — verify_otp (TOTP)
-        print("  [2/5] Verifying TOTP ...", end=" ", flush=True)
-        # Wait for a TOTP code that has at least 8 seconds left
-        import time
-        while True:
-            remaining = 30 - (int(time.time()) % 30)
-            if remaining >= 8:
-                break
-            print(f"(waiting {remaining}s for fresh code)", end=" ", flush=True)
-            await asyncio.sleep(remaining + 1)
-        otp_code = totp.now()
-        r = await c.post(f"{VAGATOR}/verify_otp",
-                         json={"request_key": rk, "otp": otp_code})
-        d = r.json()
-        if d.get("s") != "ok":
-            print(f"FAILED: {d}")
+        # ── Try SHA-256(pin) first (correct Fyers format) ─────────────────
+        rk = await _do_steps_1_and_2(c, client_id, totp_key)
+        if rk is None:
             return None
-        rk = d["request_key"]
-        print("OK")
 
-        # Step 3 — verify_pin
-        # Fyers API accepts either plain PIN or SHA-256 hashed PIN depending on
-        # the account / API version. Try plain first, fall back to hashed.
-        print("  [3/5] Verifying PIN ...", end=" ", flush=True)
-        session_token = None
-        for pin_val in [pin, sha256(pin)]:
+        print("  [3/5] Verifying PIN (SHA-256) ...", end=" ", flush=True)
+        r = await c.post(f"{VAGATOR}/verify_pin",
+                         json={"request_key": rk,
+                               "identity_type": "pin",
+                               "recaptcha_token": "",
+                               "pin": _sha256(pin)})
+        d = r.json()
+        session_token = (d.get("data") or {}).get("token")
+
+        # ── If SHA-256 fails, restart steps 1+2 and try plain PIN ─────────
+        if not session_token:
+            err_code = d.get("code", "")
+            err_msg  = d.get("message", "")
+            print(f"FAILED (code={err_code}: {err_msg}) — retrying with plain PIN ...")
+
+            rk2 = await _do_steps_1_and_2(c, client_id, totp_key)
+            if rk2 is None:
+                return None
+
+            print("  [3/5] Verifying PIN (plain) ...", end=" ", flush=True)
             r = await c.post(f"{VAGATOR}/verify_pin",
-                             json={"request_key": rk,
+                             json={"request_key": rk2,
                                    "identity_type": "pin",
                                    "recaptcha_token": "",
-                                   "pin": pin_val})
+                                   "pin": pin})
             d = r.json()
             session_token = (d.get("data") or {}).get("token")
-            if session_token:
-                break
+
         if not session_token:
-            print(f"FAILED: {d}")
-            print("\n  Troubleshooting checklist:")
-            print("  1. Open Fyers app/website and confirm your PIN works there")
-            print("  2. Check .env: BROKER_PIN must be your 4-digit trading PIN")
-            print("     (NOT your mobile OTP, NOT your app password)")
-            print("  3. Run:  grep BROKER_PIN .env  — make sure there are no")
-            print("     extra spaces, quotes, or 'export' left in the value")
+            err_code = d.get("code", "")
+            err_msg  = d.get("message", "")
+            print(f"FAILED (code={err_code}: {err_msg})")
+            _pin_error_guide(pin, current_ip)
             return None
         print("OK")
 
@@ -142,7 +183,7 @@ async def _fyers_login(
             f"{API_V3}/generate-authcode",
             headers={"Authorization": session_token},
             json={"fyers_id": client_id, "app_id": app_id,
-                  "redirect_uri": redirect_uri, "appType": "100",
+                  "redirect_uri": redirect_uri, "appType": app_id.split("-")[-1],
                   "code_challenge": "", "state": "None",
                   "scope": "", "nonce": "", "response_type": "code",
                   "create_cookie": True},
@@ -151,19 +192,19 @@ async def _fyers_login(
         url = d.get("Url", "")
         if "auth_code=" not in url:
             print(f"FAILED: {d}")
+            _ip_error_guide(current_ip)
             return None
         auth_code = parse_qs(urlparse(url).query).get("auth_code", [None])[0]
         if not auth_code:
-            print(f"FAILED: could not parse auth_code from {url}")
+            print(f"FAILED: auth_code not found in redirect URL")
             return None
         print("OK")
 
         # Step 5 — validate-authcode → access_token
         print("  [5/5] Exchanging auth code for access token ...", end=" ", flush=True)
-        app_id_hash = sha256(f"{app_id}:{secret_key}")
         r = await c.post(f"{API_V3}/validate-authcode",
                          json={"grant_type": "authorization_code",
-                               "appIdHash": app_id_hash,
+                               "appIdHash": _sha256(f"{app_id}:{secret_key}"),
                                "code": auth_code})
         d = r.json()
         token = d.get("access_token")
@@ -172,6 +213,57 @@ async def _fyers_login(
             return None
         print("OK")
         return token
+
+
+def _pin_error_guide(pin: str, current_ip: str) -> None:
+    """Print a targeted diagnosis when verify_pin fails."""
+    print()
+    print("  ╔══════════════════════════════════════════════════════╗")
+    print("  ║  PIN VERIFICATION FAILED — DIAGNOSIS                ║")
+    print("  ╠══════════════════════════════════════════════════════╣")
+    print(f"  ║  Your current public IP  : {current_ip:<26}║")
+    print("  ║                                                      ║")
+    print("  ║  MOST LIKELY CAUSE: IP Whitelist mismatch            ║")
+    print("  ║                                                      ║")
+    print("  ║  Fyers validates your IP at the PIN step.  If you   ║")
+    print("  ║  registered your EC2 IP in the Fyers API dashboard  ║")
+    print("  ║  but your EC2 is not running, calls from your Mac   ║")
+    print("  ║  are rejected as 'Invalid PIN'.                     ║")
+    print("  ║                                                      ║")
+    print("  ║  FIX (choose one):                                   ║")
+    print("  ║                                                      ║")
+    print("  ║  Option A — Add your Mac IP to Fyers whitelist:     ║")
+    print("  ║    1. Go to  myaccount.fyers.in → API → My Apps     ║")
+    print("  ║    2. Edit your app → IP Whitelist                   ║")
+    print(f"  ║    3. Add  {current_ip:<42}║")
+    print("  ║    4. Save and re-run this script                    ║")
+    print("  ║                                                      ║")
+    print("  ║  Option B — Run from EC2 (recommended for prod):    ║")
+    print("  ║    1. Start your EC2 instance                        ║")
+    print("  ║    2. SSH in:  ssh -i key.pem ec2-user@<EC2-IP>     ║")
+    print("  ║    3. cd algo_trader && source .env                  ║")
+    print("  ║    4. python3 run_real_backtest.py --all --months 12 ║")
+    print("  ║                                                      ║")
+    print("  ║  PIN checklist (if IP is NOT the issue):             ║")
+    print(f"  ║  • PIN length : {len(pin)} chars  {'✓ digits only' if pin.isdigit() else '✗ NON-DIGIT CHARS FOUND':<34}║")
+    print("  ║  • It must be your 4-digit Fyers login PIN           ║")
+    print("  ║  • Test it at  trade.fyers.in  right now             ║")
+    print("  ╚══════════════════════════════════════════════════════╝")
+
+
+def _ip_error_guide(current_ip: str) -> None:
+    """Print guidance when generate-authcode fails (clear IP mismatch)."""
+    print()
+    print("  ╔══════════════════════════════════════════════════════╗")
+    print("  ║  GENERATE-AUTHCODE FAILED — IP WHITELIST ISSUE      ║")
+    print("  ║                                                      ║")
+    print(f"  ║  Your IP  : {current_ip:<42}║")
+    print("  ║  This IP is not whitelisted in your Fyers API app.  ║")
+    print("  ║                                                      ║")
+    print("  ║  Go to  myaccount.fyers.in → API → My Apps          ║")
+    print(f"  ║  Add  {current_ip:<47}║")
+    print("  ║  to the IP Whitelist, then re-run.                   ║")
+    print("  ╚══════════════════════════════════════════════════════╝")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -189,17 +281,28 @@ async def _main(args) -> None:
     secret_key  = _require("BROKER_SECRET_KEY")
     totp_key    = _require("BROKER_TOTP_KEY")
     pin         = _require("BROKER_PIN")
-    redirect    = os.environ.get("BROKER_REDIRECT_URI", "https://127.0.0.1:8080/callback")
+    redirect    = os.environ.get("BROKER_REDIRECT_URI", "http://127.0.0.1:8080/callback")
+
+    # ── Pre-flight: detect current public IP ─────────────────────────────────
+    async with httpx.AsyncClient(timeout=10) as _c:
+        current_ip = await _get_public_ip(_c)
+
+    print(f"\n  Current public IP : {current_ip}")
+    print(f"  Client ID         : {client_id}")
+    print(f"  App ID            : {app_id[:6]}...{app_id[-4:]}")
+    print(f"  PIN               : {'*' * len(pin)} ({len(pin)} chars, "
+          f"{'digits only ✓' if pin.isdigit() else 'WARNING: non-digit chars found ✗'})")
+    print()
+    print("  NOTE: If your Fyers API app only has your EC2 IP whitelisted,")
+    print(f"  you MUST either add {current_ip} to the whitelist")
+    print("  OR run this script from your EC2 instance.\n")
 
     print("Authenticating with Fyers ...")
-    print(f"  client_id length : {len(client_id)}")
-    print(f"  app_id           : {app_id[:6]}...{app_id[-4:]}")
-    print(f"  pin length       : {len(pin)} chars  ({'digits only' if pin.isdigit() else 'WARNING: contains non-digits'})")
     access_token = await _fyers_login(
-        client_id, app_id, secret_key, totp_key, pin, redirect
+        client_id, app_id, secret_key, totp_key, pin, redirect, current_ip
     )
     if not access_token:
-        print("\n  Authentication failed. Check credentials in .env")
+        print("\n  Authentication failed. See diagnosis above.")
         sys.exit(1)
 
     print(f"\n  Access token obtained (length={len(access_token)})")

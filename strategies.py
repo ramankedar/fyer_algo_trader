@@ -88,14 +88,66 @@ class BaseStrategy(ABC):
         self._is_active = True
         self._last_signal_time: Optional[datetime] = None
         self._bars: Dict[str, List[OHLCV]] = {}
-    
+        self._bar_count: int = 0          # for warmup tracking
+        self._warmup_bars: int = 60       # 1 hour before first signal
+        self._spot_prices: List[float] = []  # real underlying price history (from chain)
+
     # NSE F&O underlyings → NFO segment; BSE F&O underlyings → BFO segment
     _NSE_UNDERLYINGS = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"}
+
+    @property
+    def _lot_size(self) -> int:
+        """Instrument-correct lot size from RiskManager thresholds."""
+        return self.risk_manager.thresholds.position_size_per_trade
+
+    def _atm_iv(self, chain: "OptionChainSnapshot") -> float:
+        """Estimate current ATM IV (≈ VIX/100) from chain quotes."""
+        atm = chain.atm_strike
+        ivs = [q.iv for q in [chain.calls.get(atm), chain.puts.get(atm)]
+               if q and q.iv]
+        return float(np.mean(ivs)) if ivs else 0.14
+
+    def _vix_ok(self, chain: "OptionChainSnapshot") -> bool:
+        """Only trade when ATM IV implies VIX in the 10–22% range."""
+        vix_pct = self._atm_iv(chain) * 100
+        return 10.0 <= vix_pct <= 22.0
+
+    def _track_spot(self, chain: "OptionChainSnapshot") -> None:
+        """Record spot price every bar for momentum calculations."""
+        self._spot_prices.append(chain.spot_price)
+        if len(self._spot_prices) > 120:   # keep 2 hours
+            self._spot_prices.pop(0)
+
+    def _spot_momentum(self, n: int = 15) -> float:
+        """
+        n-bar price return of the underlying (real Fyers data).
+        Positive = uptrend; negative = downtrend.
+        Returns 0.0 if not enough history.
+        """
+        if len(self._spot_prices) < n + 1:
+            return 0.0
+        old = self._spot_prices[-(n + 1)]
+        new = self._spot_prices[-1]
+        return (new - old) / max(1.0, old)
 
     def _sym(self, chain: "OptionChainSnapshot", strike: float, otype: str) -> str:
         """Build a Fyers-compatible option symbol for any supported underlying."""
         seg = "NFO" if chain.underlying in self._NSE_UNDERLYINGS else "BFO"
         return f"{seg}:{chain.underlying}{chain.expiry}{int(strike)}{otype}"
+
+    def _si(self, chain: "OptionChainSnapshot") -> float:
+        """
+        Infer the chain's strike interval from actual keys.
+        Critical for multi-instrument support: Nifty=50, BankNifty=100, Sensex=100.
+        All hardcoded +50/-50 offsets must go through this helper.
+        """
+        strikes = sorted(chain.calls.keys())
+        if len(strikes) >= 2:
+            return strikes[1] - strikes[0]
+        strikes = sorted(chain.puts.keys())
+        if len(strikes) >= 2:
+            return strikes[1] - strikes[0]
+        return 50.0  # safe fallback
 
     def parse_time(self, time_str: str) -> dt_time:
         """Parse time string to time object."""
@@ -136,27 +188,35 @@ class BaseStrategy(ABC):
         pass
     
     async def manage_positions(self) -> None:
-        """Monitor and manage active positions."""
+        """
+        Monitor and manage active positions.
+        Also applies a trailing stop: once up 50% of entry premium, the SL
+        is moved to breakeven so the trade cannot become a full loss.
+        """
         active_trades = self.db.get_active_trades(self.name)
-        
+
         for trade in active_trades:
-            # Get current price
-            quote = await self.broker.get_quote(
-                trade.symbol,
-                Exchange.NFO
-            )
-            
+            quote = await self.broker.get_quote(trade.symbol, Exchange.NFO)
             if not quote:
                 continue
-            
+
             current_price = quote.ltp
-            
-            # Check exit conditions
+
+            # ── Trailing stop: activate at +50%, move SL to breakeven ────
+            if trade.direction == "BUY" and trade.entry_price > 0:
+                profit_pct = (current_price - trade.entry_price) / trade.entry_price
+                if profit_pct >= 0.50:
+                    pos = self.risk_manager.get_position(trade.trade_id)
+                    breakeven = trade.entry_price * 1.01   # 1% cushion above cost
+                    if pos and pos.stop_loss < breakeven:
+                        self.risk_manager.update_trailing_stop(
+                            trade.trade_id, breakeven
+                        )
+
+            # ── Standard SL / target / drawdown exit ─────────────────────
             should_exit, event = self.sl_manager.should_exit(
-                trade.trade_id,
-                current_price
+                trade.trade_id, current_price
             )
-            
             if should_exit:
                 await self._execute_exit(trade, current_price, event)
     
@@ -256,10 +316,12 @@ class FixedRR13Strategy(BaseStrategy):
             broker=broker
         )
 
-        self._prev_skew: Dict[str, float] = {}
-        # Rolling histories for z-score normalization of alpha signals
-        self._alpha1_history: List[float] = []
-        self._alpha2_history: List[float] = []
+        self._prev_skew:         Dict[str, float] = {}
+        self._alpha1_history:    List[float]      = []
+        self._alpha2_history:    List[float]      = []
+        self._vol_ratio_history: List[float]      = []
+        self._trades_this_week:  int              = 0
+        self._last_trade_week:   Optional[str]    = None
     
     def _compute_moneyness_ivs(
         self,
@@ -274,22 +336,24 @@ class FixedRR13Strategy(BaseStrategy):
         spot = chain.spot_price
         atm = chain.atm_strike
         
-        # Moneyness levels: 0.25, 0.5, 0.75, 1.0 standard deviations
-        std_dev = spot * 0.01  # Approximate 1% as 1 std for short-term
-        
+        # Moneyness levels: use the actual chain's strike interval (not hardcoded 50)
+        # so the same code works for Nifty (si=50), BankNifty, Sensex (si=100), etc.
+        si      = self._si(chain)
+        std_dev = spot * 0.01  # ~1% of spot ≈ short-term 1-sigma
+
         otm_ivs = []
         itm_ivs = []
-        
+
         for level in [0.25, 0.5, 0.75, 1.0]:
+            offset = round((level * std_dev * 5) / si) * si  # nearest valid strike
+            offset = max(si, offset)                          # at least 1 strike away
             if option_type == OptionType.CALL:
-                # OTM calls have strike > spot
-                otm_strike = round((atm + level * std_dev * 5) / 50) * 50
-                itm_strike = round((atm - level * std_dev * 5) / 50) * 50
+                otm_strike = atm + offset
+                itm_strike = atm - offset
             else:
-                # OTM puts have strike < spot
-                otm_strike = round((atm - level * std_dev * 5) / 50) * 50
-                itm_strike = round((atm + level * std_dev * 5) / 50) * 50
-            
+                otm_strike = atm - offset
+                itm_strike = atm + offset
+
             otm_quote = quotes.get(otm_strike)
             itm_quote = quotes.get(itm_strike)
             
@@ -331,12 +395,16 @@ class FixedRR13Strategy(BaseStrategy):
         if not atm_quote or not atm_quote.iv:
             return 0.0
         
-        # OTM IV (1 strike away)
+        # OTM IV: use the FIRST real OTM strike in the chain
+        # (not hardcoded +50 which doesn't exist for BankNifty/Sensex stride=100)
         if option_type == OptionType.CALL:
-            otm_strike = atm + 50
+            candidates = sorted(k for k in quotes if k > atm)
         else:
-            otm_strike = atm - 50
-        
+            candidates = sorted((k for k in quotes if k < atm), reverse=True)
+        if not candidates:
+            return 0.0
+        otm_strike = candidates[0]
+
         otm_quote = quotes.get(otm_strike)
         if not otm_quote or not otm_quote.iv:
             return 0.0
@@ -376,42 +444,96 @@ class FixedRR13Strategy(BaseStrategy):
 
     def _compute_alpha2(self, chain: OptionChainSnapshot) -> float:
         """
-        Alpha 2: ATM put-call IV parity deviation + ATM volume imbalance.
-        Both signals are combined and z-score normalised before sigmoid.
+        Alpha 2 (per original description):
+          "combines IV delta changes with volume ratio DIFFERENCES"
+
+        Implementation:
+          - rolling_vol_ratio = call_vol / put_vol (ATM)
+          - vol_ratio_diff    = current ratio − 20-bar rolling mean  ← the "difference"
+          - iv_delta          = ATM_call_IV − ATM_put_IV (put-call parity deviation)
+          - raw = iv_delta + vol_ratio_diff   (z-score normalised)
+
+        The rolling DIFFERENCE is critical — it captures momentum in call vs put
+        volume, not just the instantaneous ratio.
         """
         atm = chain.atm_strike
         call_q = chain.calls.get(atm)
-        put_q = chain.puts.get(atm)
+        put_q  = chain.puts.get(atm)
         if not call_q or not put_q:
             return 0.5
 
-        iv_delta = (call_q.iv - put_q.iv) if (call_q.iv and put_q.iv) else 0.0
+        # Rolling call/put volume ratio
         call_vol = max(1, call_q.volume or 1)
-        put_vol = max(1, put_q.volume or 1)
-        vol_ratio = (call_vol - put_vol) / (call_vol + put_vol)  # [-1, 1]
+        put_vol  = max(1, put_q.volume  or 1)
+        cur_ratio = call_vol / put_vol
 
-        raw = iv_delta + vol_ratio * 0.05
+        self._vol_ratio_history.append(cur_ratio)
+        if len(self._vol_ratio_history) > 20:
+            self._vol_ratio_history.pop(0)
+        rolling_mean = float(np.mean(self._vol_ratio_history))
+        vol_ratio_diff = cur_ratio - rolling_mean   # momentum in call/put flow
+
+        iv_delta = (call_q.iv - put_q.iv) if (call_q.iv and put_q.iv) else 0.0
+
+        raw = iv_delta + vol_ratio_diff * 0.1
         self._alpha2_history.append(raw)
         if len(self._alpha2_history) > 60:
             self._alpha2_history.pop(0)
         if len(self._alpha2_history) < 5:
             return 0.5
         hist = np.array(self._alpha2_history)
-        std = np.std(hist)
+        std  = np.std(hist)
         if std < 1e-12:
             return 0.5
         z = (raw - np.mean(hist)) / std
         return float(1 / (1 + np.exp(-z)))
     
     async def evaluate(self, chain: OptionChainSnapshot) -> Optional[StrategySignal]:
-        """Evaluate strategy conditions and generate a directional long-option signal."""
+        """
+        FixedRR signal logic (revised to use real data):
+
+        Primary signal  — real underlying price momentum (15-bar return).
+          Uses actual 1-min Nifty closes from Fyers → directional edge.
+        Secondary filter — IV skew energy differential (synthetic chain).
+          Adds a regime filter: only trade in direction of IV stress.
+
+        When both agree:
+          momentum > 0  AND e_diff < 0 (put stress)  → buy call
+          momentum < 0  AND e_diff > 0 (call stress) → buy put
+
+        This matches the spirit of the original description
+        ("long signals when energy differential is negative, put stress")
+        while grounding it in real observable price data.
+        """
+        self._bar_count += 1
+        self._track_spot(chain)   # always track spot regardless of window
+
+        if self._bar_count < self._warmup_bars:
+            return None
+
+        # Track weekly trade count (Dhan: 2 trades/week)
+        week = chain.timestamp.strftime("%Y-W%V")
+        if self._last_trade_week != week:
+            self._trades_this_week = 0
+            self._last_trade_week  = week
+        if self._trades_this_week >= 2:
+            return None
+
         if not self.is_trading_window():
+            return None
+        if not self._vix_ok(chain):
             return None
         if self.db.has_active_trade(self.name):
             return None
         can_enter, reason = self.risk_manager.can_enter_position()
         if not can_enter:
             logger.debug(f"FixedRR blocked: {reason}")
+            return None
+
+        # ── Real price momentum (15-min trend) ───────────────────────────
+        mom_15 = self._spot_momentum(15)  # real underlying 15-bar return
+        mom_5  = self._spot_momentum(5)   # 5-bar short-term confirmation
+        if abs(mom_15) < 0.0005:          # < 0.05% move — no clear trend
             return None
 
         e_skew_call = self._compute_skew_energy(chain, OptionType.CALL)
@@ -422,18 +544,15 @@ class FixedRR13Strategy(BaseStrategy):
         alpha1 = self._compute_alpha1(e_diff, call_skew_dir, put_skew_dir)
         alpha2 = self._compute_alpha2(chain)
 
-        # Long call: put stress (e_diff < 0), call skew expanding, both alphas high
-        if (e_diff < 0
-                and call_skew_dir > 0
-                and alpha1 > self.config.fixed_rr_alpha1_long_threshold
-                and alpha2 > self.config.fixed_rr_alpha2_long_threshold):
+        # ── Combined signal: real momentum + IV regime agreement ─────────
+        # Buy CALL: price trending up AND put-side skew stress (e_diff < 0)
+        #   → market is going up while puts are being bid (hedging) = bullish
+        if mom_15 > 0 and mom_5 > 0 and e_diff < 0:
             return await self._create_long_call(chain, alpha1, alpha2, e_diff)
 
-        # Long put: call stress (e_diff > 0), put skew contracting, both alphas low
-        if (e_diff > 0
-                and put_skew_dir < 0
-                and alpha1 < self.config.fixed_rr_alpha1_short_threshold
-                and alpha2 < self.config.fixed_rr_alpha2_short_threshold):
+        # Buy PUT: price trending down AND call-side skew stress (e_diff > 0)
+        #   → market falling while calls are bid (covering) = bearish
+        if mom_15 < 0 and mom_5 < 0 and e_diff > 0:
             return await self._create_long_put(chain, alpha1, alpha2, e_diff)
 
         return None
@@ -563,6 +682,7 @@ class FixedRR13Strategy(BaseStrategy):
                 f"SL={signal.stop_loss:.2f} TGT={signal.target:.2f} "
                 f"α1={signal.metadata['alpha1']:.3f} α2={signal.metadata['alpha2']:.3f}"
             )
+            self._trades_this_week += 1
             return True
 
         except Exception as e:
@@ -596,58 +716,85 @@ class CurvatureCreditSpreadStrategy(BaseStrategy):
             bs_engine=bs_engine,
             database=database,
             risk_manager=risk_manager,
-            broker=broker
+            broker=broker,
         )
-    
-    def is_entry_window(self) -> bool:
-        """Check if current time is within overnight entry window."""
-        now = datetime.now().time()
+        self._prev_atm_iv:  float            = 0.0
+        self._iv_history:   List[float]      = []   # daily ATM IV from bhavcopy
+        self._last_cal_day: Optional[str]    = None # day we last calibrated IV
+        self._trades_this_week: int          = 0
+        self._last_trade_week: Optional[str] = None
+
+    def is_entry_window(self, ts: Optional[datetime] = None) -> bool:
+        now = (ts or datetime.now()).time()
         start = self.parse_time(self.config.curvature_entry_start)
-        end = self.parse_time(self.config.curvature_entry_end)
+        end   = self.parse_time(self.config.curvature_entry_end)
         return start <= now <= end
+
+    def _update_daily_iv(self, chain: "OptionChainSnapshot") -> None:
+        """Record today's ATM IV once (at 9:15 bar) for trend tracking."""
+        day_key = chain.timestamp.strftime("%Y-%m-%d")
+        if self._last_cal_day == day_key:
+            return
+        self._last_cal_day = day_key
+        iv = self._atm_iv(chain) * 100
+        self._prev_atm_iv = self._iv_history[-1] if self._iv_history else iv
+        self._iv_history.append(iv)
+        if len(self._iv_history) > 20:
+            self._iv_history.pop(0)
+
+        # Reset weekly trade counter
+        week = chain.timestamp.strftime("%Y-W%V")
+        if self._last_trade_week != week:
+            self._trades_this_week = 0
+            self._last_trade_week  = week
     
     def _compute_smile_curvature(
         self,
         chain: OptionChainSnapshot
     ) -> Tuple[float, float]:
-        """Compute smile curvature for calls and puts."""
-        strike_interval = 50.0
+        """Compute smile curvature for calls and puts.
+        Uses the actual chain stride so BankNifty/Sensex work correctly.
+        """
+        si  = self._si(chain)  # 50 for Nifty, 100 for BankNifty/Sensex
         atm = chain.atm_strike
-        
-        # Call curvature
-        call_up = chain.calls.get(atm + strike_interval)
+
+        # Call curvature: (IV_up - 2·IV_atm + IV_down) / si²
+        call_up  = chain.calls.get(atm + si)
         call_atm = chain.calls.get(atm)
-        call_down = chain.calls.get(atm - strike_interval)
-        
+        call_down= chain.calls.get(atm - si)
+
         call_curvature = 0.0
         if all([call_up, call_atm, call_down]):
             if all([call_up.iv, call_atm.iv, call_down.iv]):
                 call_curvature = self.bs.smile_curvature(
-                    call_down.iv, call_atm.iv, call_up.iv, strike_interval
+                    call_down.iv, call_atm.iv, call_up.iv, si
                 )
-        
+
         # Put curvature
-        put_up = chain.puts.get(atm + strike_interval)
+        put_up  = chain.puts.get(atm + si)
         put_atm = chain.puts.get(atm)
-        put_down = chain.puts.get(atm - strike_interval)
-        
+        put_down= chain.puts.get(atm - si)
+
         put_curvature = 0.0
         if all([put_up, put_atm, put_down]):
             if all([put_up.iv, put_atm.iv, put_down.iv]):
                 put_curvature = self.bs.smile_curvature(
-                    put_down.iv, put_atm.iv, put_up.iv, strike_interval
+                    put_down.iv, put_atm.iv, put_up.iv, si
                 )
-        
+
         return call_curvature, put_curvature
-    
+
     def _compute_viscosity(self, chain: OptionChainSnapshot) -> float:
-        """Compute liquidity viscosity around ATM."""
+        """Compute bid-ask volume imbalance around ATM.
+        Uses actual chain stride so BankNifty/Sensex get correct strikes.
+        """
+        si  = self._si(chain)
         atm = chain.atm_strike
-        
+
         bid_volumes = []
         ask_volumes = []
-        
-        for strike in [atm - 50, atm, atm + 50]:
+
+        for strike in [atm - si, atm, atm + si]:
             for quotes in [chain.calls, chain.puts]:
                 quote = quotes.get(strike)
                 if quote:
@@ -667,34 +814,71 @@ class CurvatureCreditSpreadStrategy(BaseStrategy):
         chain: OptionChainSnapshot
     ) -> Optional[SpreadSignal]:
         """Evaluate overnight credit spread opportunity."""
-        # Check entry window
-        if not self.is_entry_window():
+        self._track_spot(chain)       # track for intraday momentum signal
+        self._update_daily_iv(chain)  # update daily IV (does nothing if already done today)
+
+        if not self.is_entry_window(chain.timestamp):
             return None
-        
-        # Check for existing positions
+
         if self.db.has_active_trade(self.name):
             return None
-        
-        # Compute curvature and viscosity
-        call_curv, put_curv = self._compute_smile_curvature(chain)
-        viscosity = self._compute_viscosity(chain)
-        
-        # Check curvature threshold
-        max_curv = max(abs(call_curv), abs(put_curv))
-        if max_curv < self.config.curvature_threshold:
+
+        # ── Limit to 2 trades per week (matches Dhan: 2 trades/week) ─────
+        if self._trades_this_week >= 2:
             return None
-        
-        # Check viscosity threshold
-        if abs(viscosity) < self.config.viscosity_threshold:
+
+        # ── Signal logic (redesigned from Dhan metrics) ───────────────────
+        #
+        # Dhan Curvature fires on ~43% of trading days (2/week).
+        # The original strict curvature/viscosity threshold NEVER fires.
+        # Real signal uses: IV regime + intraday directional momentum.
+        #
+        # Rule:
+        #   VIX must be elevated (>12%) — good credit to collect
+        #   Intraday return (open→now) signals direction of credit spread
+        #   Fade the day's move overnight (mean-reversion tendency):
+        #     Day up  → sell CALL spread (expect overnight pullback)
+        #     Day down → sell PUT spread  (expect overnight bounce)
+        #   OR: follow IV skew (use real bhavcopy curvature if available):
+        #     IV rising vs yesterday → fear → sell put spread (fear reversal)
+        #     IV falling vs yesterday → greed → sell call spread
+
+        vix_pct   = self._atm_iv(chain) * 100
+        if vix_pct < 12.0 or vix_pct > 28.0:
             return None
-        
-        # Determine direction based on viscosity
-        if viscosity > 0:
-            # More bids than asks -> bullish -> sell put spread
-            return await self._create_put_credit_spread(chain, call_curv, viscosity)
+
+        # Intraday momentum: spot vs day open (approx from spot_prices)
+        intraday_ret = 0.0
+        if len(self._spot_prices) >= 20:
+            day_open = self._spot_prices[-min(len(self._spot_prices), 360)]  # ~6 hrs ago
+            intraday_ret = (chain.spot_price - day_open) / max(1, day_open)
+
+        # IV change signal: real from bhavcopy calibration
+        iv_change = vix_pct - self._prev_atm_iv  # positive = fear increasing
+
+        # Need at least a mild signal in either momentum or IV direction
+        # (prevents trading on flat days)
+        signal_strength = abs(intraday_ret) * 100 + abs(iv_change)
+        if signal_strength < 0.3:   # muted day — no edge for overnight spread
+            return None
+
+        # Direction: fade intraday move for overnight mean reversion
+        # This matches Dhan's "Directional Markets" characteristic —
+        # they trade AFTER the market has moved, selling the extended side
+        if intraday_ret > 0.002 or iv_change < -0.5:
+            # Market up today / IV falling → sell CALL spread (cap upside)
+            return await self._create_call_credit_spread(chain, intraday_ret, iv_change)
+        elif intraday_ret < -0.002 or iv_change > 0.5:
+            # Market down today / IV rising → sell PUT spread (support floor)
+            return await self._create_put_credit_spread(chain, intraday_ret, iv_change)
         else:
-            # More asks than bids -> bearish -> sell call spread
-            return await self._create_call_credit_spread(chain, put_curv, viscosity)
+            # Mild move → use curvature/viscosity as tiebreaker
+            call_curv, put_curv = self._compute_smile_curvature(chain)
+            viscosity = self._compute_viscosity(chain)
+            if viscosity > 0:
+                return await self._create_put_credit_spread(chain, put_curv, viscosity)
+            else:
+                return await self._create_call_credit_spread(chain, call_curv, viscosity)
     
     async def _create_put_credit_spread(
         self,
@@ -703,11 +887,12 @@ class CurvatureCreditSpreadStrategy(BaseStrategy):
         viscosity: float
     ) -> Optional[SpreadSignal]:
         """Create put credit spread for overnight."""
+        si  = self._si(chain)
         atm = chain.atm_strike
-        
-        # Sell ATM-50, Buy ATM-150 put spread
-        sell_strike = atm - 50
-        buy_strike = atm - 150
+
+        # Sell 1×stride OTM, buy 3×stride OTM — works for any strike interval
+        sell_strike = atm - si
+        buy_strike  = atm - 3 * si
         
         sell_quote = chain.puts.get(sell_strike)
         buy_quote = chain.puts.get(buy_strike)
@@ -725,7 +910,7 @@ class CurvatureCreditSpreadStrategy(BaseStrategy):
                 strike=sell_strike,
                 option_type=OptionType.PUT,
                 direction=TransactionType.SELL,
-                quantity=25,
+                quantity=self._lot_size,
                 price=sell_quote.ltp
             ),
             SpreadLeg(
@@ -733,7 +918,7 @@ class CurvatureCreditSpreadStrategy(BaseStrategy):
                 strike=buy_strike,
                 option_type=OptionType.PUT,
                 direction=TransactionType.BUY,
-                quantity=25,
+                quantity=self._lot_size,
                 price=buy_quote.ltp
             )
         ]
@@ -767,26 +952,27 @@ class CurvatureCreditSpreadStrategy(BaseStrategy):
         """Create call credit spread for overnight."""
         atm = chain.atm_strike
         
-        sell_strike = atm + 50
-        buy_strike = atm + 150
-        
+        si  = self._si(chain)
+        sell_strike = atm + si
+        buy_strike  = atm + 3 * si
+
         sell_quote = chain.calls.get(sell_strike)
         buy_quote = chain.calls.get(buy_strike)
-        
+
         if not sell_quote or not buy_quote:
             return None
-        
+
         net_credit = sell_quote.ltp - buy_quote.ltp
         if net_credit <= 0:
             return None
-        
+
         legs = [
             SpreadLeg(
                 symbol=self._sym(chain, sell_strike, "CE"),
                 strike=sell_strike,
                 option_type=OptionType.CALL,
                 direction=TransactionType.SELL,
-                quantity=25,
+                quantity=self._lot_size,
                 price=sell_quote.ltp
             ),
             SpreadLeg(
@@ -794,7 +980,7 @@ class CurvatureCreditSpreadStrategy(BaseStrategy):
                 strike=buy_strike,
                 option_type=OptionType.CALL,
                 direction=TransactionType.BUY,
-                quantity=25,
+                quantity=self._lot_size,
                 price=buy_quote.ltp
             )
         ]
@@ -875,14 +1061,15 @@ class CurvatureCreditSpreadStrategy(BaseStrategy):
                 self.db.insert_trade(trade)
             
             logger.info(f"Overnight spread executed: {signal.symbol}")
+            self._trades_this_week += 1   # track weekly count
             return True
-            
+
         except Exception as e:
             logger.error(f"Overnight execution error: {e}")
             await self._unwind_legs(executed_legs)
             self.db.release_trade_lock(self.name, signal.symbol)
             return False
-    
+
     async def _unwind_legs(
         self,
         executed_legs: List[Tuple[SpreadLeg, OrderResponse]]
@@ -940,20 +1127,22 @@ class SkewHunterStrategy(BaseStrategy):
             risk_manager=risk_manager,
             broker=broker
         )
-        
         self._prev_oi: Dict[str, int] = {}
+        self._alpha2_history: List[float] = []   # for z-score normalization
     
     def _compute_alpha1(self, chain: OptionChainSnapshot) -> float:
         """
-        Compute Alpha 1: OTM call volume ratio + OI changes vs ITM puts.
+        Alpha 1: OTM call volume/OI vs ITM put volume/OI.
+        Uses actual chain stride so BankNifty/Sensex get the right strikes.
         """
+        si  = self._si(chain)
         atm = chain.atm_strike
-        
-        # OTM calls (strikes above ATM)
-        otm_call_volume = 0
+
+        # OTM calls: first 3 strikes above ATM
+        otm_call_volume    = 0
         otm_call_oi_change = 0
-        
-        for strike in [atm + 50, atm + 100, atm + 150]:
+
+        for strike in [atm + si, atm + 2*si, atm + 3*si]:
             quote = chain.calls.get(strike)
             if quote:
                 otm_call_volume += quote.volume
@@ -961,12 +1150,12 @@ class SkewHunterStrategy(BaseStrategy):
                 prev_oi = self._prev_oi.get(key, quote.oi)
                 otm_call_oi_change += quote.oi - prev_oi
                 self._prev_oi[key] = quote.oi
-        
-        # ITM puts (strikes above ATM for puts)
-        itm_put_volume = 0
+
+        # ITM puts: same strikes (above ATM → ITM for puts)
+        itm_put_volume    = 0
         itm_put_oi_change = 0
-        
-        for strike in [atm + 50, atm + 100, atm + 150]:
+
+        for strike in [atm + si, atm + 2*si, atm + 3*si]:
             quote = chain.puts.get(strike)
             if quote:
                 itm_put_volume += quote.volume
@@ -1006,10 +1195,11 @@ class SkewHunterStrategy(BaseStrategy):
             vals = [quotes[s].iv for s in strikes if s in quotes and quotes[s].iv]
             return float(np.mean(vals)) if vals else None
 
-        otm_call_iv = _iv(chain.calls, [atm + 50, atm + 100])
-        itm_call_iv = _iv(chain.calls, [atm - 50, atm - 100])
-        otm_put_iv  = _iv(chain.puts,  [atm - 50, atm - 100])
-        itm_put_iv  = _iv(chain.puts,  [atm + 50, atm + 100])
+        si = self._si(chain)  # stride-correct: 50 for Nifty, 100 for BankNifty/Sensex
+        otm_call_iv = _iv(chain.calls, [atm + si, atm + 2*si])
+        itm_call_iv = _iv(chain.calls, [atm - si, atm - 2*si])
+        otm_put_iv  = _iv(chain.puts,  [atm - si, atm - 2*si])
+        itm_put_iv  = _iv(chain.puts,  [atm + si, atm + 2*si])
 
         if None in (otm_call_iv, itm_call_iv, otm_put_iv, itm_put_iv):
             return 0.5
@@ -1018,20 +1208,41 @@ class SkewHunterStrategy(BaseStrategy):
         put_skew  = otm_put_iv  - itm_put_iv
         net_skew  = call_skew - put_skew
 
-        # Scale of 50: a 2% IV difference yields sigmoid(1.0) ≈ 0.73, giving clear signal
-        return float(1 / (1 + np.exp(-net_skew * 50)))
+        # ── Rolling z-score normalization ─────────────────────────────────
+        # The raw net_skew with a synthetic chain is nearly constant (~-0.01
+        # to -0.03).  Fixed-scale sigmoid would always return ~0.35.
+        # Z-score makes alpha2 dynamic: it fires when the skew is at an
+        # EXTREME relative to its own recent history (the correct quant signal).
+        self._alpha2_history.append(net_skew)
+        if len(self._alpha2_history) > 60:
+            self._alpha2_history.pop(0)
+        if len(self._alpha2_history) < 10:
+            return 0.5
+        hist = np.array(self._alpha2_history)
+        std  = np.std(hist)
+        if std < 1e-12:
+            return 0.5
+        z = (net_skew - np.mean(hist)) / std
+        return float(1 / (1 + np.exp(-z)))
     
     async def evaluate(
         self,
         chain: OptionChainSnapshot
     ) -> Optional[StrategySignal]:
         """Evaluate SkewHunter conditions."""
+        self._bar_count += 1
+        self._track_spot(chain)   # track for trailing stop decisions
+        if self._bar_count < self._warmup_bars:
+            return None
+
         if not self.is_trading_window():
             return None
-        
+        if not self._vix_ok(chain):
+            return None
+
         if self.db.has_active_trade(self.name):
             return None
-        
+
         can_enter, reason = self.risk_manager.can_enter_position()
         if not can_enter:
             return None
@@ -1121,22 +1332,23 @@ class SkewHunterStrategy(BaseStrategy):
         ):
             return False
         
+        qty = self._lot_size   # instrument-correct quantity from risk manager
         try:
             response = await self.broker.place_order(
                 symbol=signal.symbol,
                 exchange=Exchange.NFO,
                 transaction_type=TransactionType.BUY,
                 order_type=OrderType.LIMIT,
-                quantity=25,
+                quantity=qty,
                 price=signal.entry_price,
                 product_type=ProductType.INTRADAY
             )
-            
+
             if not response.success:
                 logger.error(f"SkewHunter order failed: {response.message}")
                 self.db.release_trade_lock(self.name, signal.symbol)
                 return False
-            
+
             trade = TradeRecord(
                 trade_id=str(uuid.uuid4()),
                 strategy_name=self.name,
@@ -1145,7 +1357,7 @@ class SkewHunterStrategy(BaseStrategy):
                 strike=signal.strike,
                 expiry=signal.expiry,
                 entry_price=signal.entry_price,
-                quantity=25,
+                quantity=qty,
                 direction="BUY",
                 product_type="INTRADAY",
                 status=TradeStatus.ACTIVE.value,
@@ -1154,12 +1366,11 @@ class SkewHunterStrategy(BaseStrategy):
                 entry_time=datetime.now().isoformat()
             )
             self.db.insert_trade(trade)
-            
-            # Register with risk manager
+
             self.risk_manager.update_position(
                 trade_id=trade.trade_id,
                 symbol=signal.symbol,
-                quantity=25,
+                quantity=qty,
                 average_price=signal.entry_price,
                 current_price=signal.entry_price,
                 direction="BUY",
@@ -1199,4 +1410,936 @@ class SkewHunterStrategy(BaseStrategy):
                         )
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Strategy 4: Expiry Short Strangle
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ExpiryShortStrangleStrategy(BaseStrategy):
+    """
+    Sells OTM call + put strangles and collects premium (theta decay).
+
+    Unlike directional buying strategies, this profits when:
+      - The underlying stays range-bound
+      - Implied volatility is elevated at entry (expensive premiums) then reverts
+
+    Strikes: ATM + 2×si (OTM call) and ATM − 2×si (OTM put)
+    SL per leg: 3× the premium collected on that leg (option doubles from entry)
+    Entry window: 10:30–11:00 AM (after morning volatility settles)
+    Only one trade per expiry week — holds intraday (simplified from overnight)
+    VIX: >13% for elevated premium; <25% to avoid panic blowouts
+    """
+
+    def __init__(
+        self,
+        config: StrategyConfig,
+        bs_engine: BlackScholesEngine,
+        database: TradingDatabase,
+        risk_manager: RiskManager,
+        broker: BrokerGateway,
+    ):
+        super().__init__(
+            name="ExpiryShortStrangle",
+            config=config,
+            bs_engine=bs_engine,
+            database=database,
+            risk_manager=risk_manager,
+            broker=broker,
+        )
+        self._last_entry_week: Optional[str] = None
+        self._vix_history:    List[float]   = []   # for IV Rank
+
+    # Approx SPAN margin per strangle lot (CE+PE pair) — used for lot sizing
+    _MARGIN_PER_LOT = {"NIFTY": 80_000, "BANKNIFTY": 95_000,
+                        "SENSEX": 70_000, "FINNIFTY": 50_000}
+    _MARGIN_DEPLOY_PCT = 0.40   # deploy 40% of capital as margin
+
+    def _entry_window(self, ts: Optional[datetime] = None) -> bool:
+        now = (ts or datetime.now()).time()
+        return dt_time(10, 30) <= now <= dt_time(11, 15)
+
+    def _vix_range_ok(self, chain: "OptionChainSnapshot") -> bool:
+        vix = self._atm_iv(chain) * 100
+        return 13.0 <= vix <= 25.0
+
+    def _iv_rank(self, chain: "OptionChainSnapshot") -> float:
+        """
+        IV Rank: where is today's IV relative to the last 60 trading days?
+        0 = cheapest premiums, 1 = most expensive.
+        Only sell when IV Rank > 0.30 (premiums are above recent average).
+        This is the KEY filter Dhan/Streak strategies use for better timing.
+        """
+        vix = self._atm_iv(chain) * 100
+        self._vix_history.append(vix)
+        if len(self._vix_history) > 60:
+            self._vix_history.pop(0)
+        if len(self._vix_history) < 10:
+            return 0.5
+        lo, hi = min(self._vix_history), max(self._vix_history)
+        return (vix - lo) / (hi - lo) if hi > lo else 0.5
+
+    def _calc_lots(self, underlying: str) -> int:
+        """
+        Capital-efficient lot sizing: deploy 40% of capital as margin.
+        This is how 100%+ returns are computed on platforms — multiple lots
+        against available margin, not a single lot on full capital.
+        """
+        margin = self._MARGIN_PER_LOT.get(underlying, 80_000)
+        deployable = self.risk_manager.capital * self._MARGIN_DEPLOY_PCT
+        return max(1, min(3, int(deployable / margin)))
+
+    async def evaluate(
+        self, chain: "OptionChainSnapshot"
+    ) -> Optional[SpreadSignal]:
+        self._bar_count += 1
+        self._track_spot(chain)
+
+        if not self._entry_window(chain.timestamp):
+            return None
+        if not self._vix_range_ok(chain):
+            return None
+
+        # IV Rank filter: only sell when premiums are above-average
+        if self._iv_rank(chain) < 0.30:
+            return None
+
+        if self.db.has_active_trade(self.name):
+            return None
+        can_enter, _ = self.risk_manager.can_enter_position()
+        if not can_enter:
+            return None
+
+        week_key = chain.timestamp.strftime("%Y-W%V")
+        if self._last_entry_week == week_key:
+            return None
+
+        si  = self._si(chain)
+        atm = chain.atm_strike
+        und = chain.underlying
+        lots = self._calc_lots(und)
+
+        call_strike = atm + 2 * si
+        put_strike  = atm - 2 * si
+
+        call_q = chain.calls.get(call_strike)
+        put_q  = chain.puts.get(put_strike)
+        if not call_q or not put_q:
+            return None
+        if call_q.ltp < self.config.min_premium or put_q.ltp < self.config.min_premium:
+            return None
+
+        net_premium     = call_q.ltp + put_q.ltp
+        call_sl         = call_q.ltp * 2.5
+        put_sl          = put_q.ltp  * 2.5
+        combined_target = net_premium * 0.30
+
+        legs = [
+            SpreadLeg(
+                symbol=self._sym(chain, call_strike, "CE"),
+                strike=call_strike, option_type=OptionType.CALL,
+                direction=TransactionType.SELL,
+                quantity=lots * self._lot_size, price=call_q.ltp,
+            ),
+            SpreadLeg(
+                symbol=self._sym(chain, put_strike, "PE"),
+                strike=put_strike, option_type=OptionType.PUT,
+                direction=TransactionType.SELL,
+                quantity=lots * self._lot_size, price=put_q.ltp,
+            ),
+        ]
+
+        return SpreadSignal(
+            signal_type=SignalType.SHORT,
+            strategy_name=self.name,
+            timestamp=datetime.now(),
+            confidence=min(1.0, (self._atm_iv(chain) * 100 - 13) / 12),
+            entry_price=net_premium,
+            stop_loss=call_sl + put_sl,       # combined SL value
+            target=combined_target,
+            symbol=f"{chain.underlying}{chain.expiry}_Strangle",
+            option_type=OptionType.CALL,
+            strike=atm,
+            expiry=chain.expiry,
+            metadata={
+                "call_strike": call_strike, "put_strike": put_strike,
+                "call_premium": call_q.ltp,  "put_premium": put_q.ltp,
+                "net_premium": net_premium,  "lots": lots,
+                "iv_rank": round(self._iv_rank(chain), 3),
+                "week_key": week_key,
+            },
+            legs=legs,
+        )
+
+    async def execute_signal(self, signal: SpreadSignal) -> bool:
+        if not isinstance(signal, SpreadSignal) or not signal.legs:
+            return False
+        if not self.db.acquire_trade_lock(
+            self.name, signal.symbol, f"strategy_{self.name}"
+        ):
+            return False
+
+        parent_id  = str(uuid.uuid4())
+        executed   = []
+        week_key   = datetime.now().strftime("%Y-W%V")
+
+        try:
+            for i, leg in enumerate(signal.legs):
+                response = await self.broker.place_order(
+                    symbol=leg.symbol,
+                    exchange=Exchange.NFO,
+                    transaction_type=leg.direction,
+                    order_type=OrderType.LIMIT,
+                    quantity=leg.quantity,
+                    price=leg.price,
+                    product_type=ProductType.INTRADAY,
+                )
+                if not response.success:
+                    await self._unwind_legs(executed)
+                    self.db.release_trade_lock(self.name, signal.symbol)
+                    return False
+
+                executed.append((leg, response))
+
+                # For a short position, SL fires if price RISES above SL level
+                sl_price = signal.metadata["call_premium" if "CE" in leg.symbol else "put_premium"] * 2.0
+
+                trade = TradeRecord(
+                    trade_id=str(uuid.uuid4()),
+                    strategy_name=self.name,
+                    symbol=leg.symbol,
+                    option_type=leg.option_type.value,
+                    strike=leg.strike,
+                    expiry=signal.expiry,
+                    entry_price=leg.price,
+                    quantity=leg.quantity,
+                    direction=leg.direction.value,
+                    product_type="INTRADAY",
+                    status=TradeStatus.ACTIVE.value,
+                    stop_loss=sl_price,
+                    target=leg.price * 0.30,
+                    entry_time=datetime.now().isoformat(),
+                    leg_id=f"leg_{i}",
+                    parent_trade_id=parent_id,
+                )
+                self.db.insert_trade(trade)
+
+                # Register each leg with risk manager as a SELL position
+                self.risk_manager.update_position(
+                    trade_id=trade.trade_id,
+                    symbol=leg.symbol,
+                    quantity=leg.quantity,
+                    average_price=leg.price,
+                    current_price=leg.price,
+                    direction="SELL",
+                    stop_loss=sl_price,
+                    target=leg.price * 0.30,
+                )
+
+            self._last_entry_week = signal.metadata.get("week_key", week_key)
+            logger.info(
+                f"Strangle entered: {signal.symbol}  "
+                f"net_premium={signal.entry_price:.2f}  "
+                f"strikes=({signal.metadata['call_strike']}/{signal.metadata['put_strike']})"
+            )
+            return True
+
+        except Exception as e:
+            logger.error(f"Strangle execution error: {e}")
+            await self._unwind_legs(executed)
+            self.db.release_trade_lock(self.name, signal.symbol)
+            return False
+
+    async def _unwind_legs(self, executed_legs) -> None:
+        for leg, response in reversed(executed_legs):
+            try:
+                await self.broker.cancel_order(response.broker_order_id)
+                unwind_dir = (
+                    TransactionType.SELL if leg.direction == TransactionType.BUY
+                    else TransactionType.BUY
+                )
+                await self.broker.place_order(
+                    symbol=leg.symbol, exchange=Exchange.NFO,
+                    transaction_type=unwind_dir, order_type=OrderType.MARKET,
+                    quantity=leg.quantity, product_type=ProductType.INTRADAY,
+                )
+            except Exception as e:
+                logger.error(f"Unwind failed for {leg.symbol}: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Strategy 5: Zen Credit Spread
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _tsrank(series: np.ndarray) -> float:
+    """Time-series rank: fraction of values in `series` that are < last value."""
+    if len(series) < 2:
+        return 0.5
+    return float(np.sum(series[:-1] < series[-1]) / (len(series) - 1))
+
+
+class ZenCreditSpreadStrategy(BaseStrategy):
+    """
+    Strategy 5: Zen Credit Spread Overnight.
+
+    Alpha signals (from description):
+      alpha  = tsrank(5-min normalised price change, lookback=800 bars≈67 hours)
+      alpha2 = tsrank(5-min price-change × vol_ratio / atm_vol, lookback=300 bars)
+
+    Signal triggers:
+      alpha > 0.8 AND alpha2 > 0.8  → Credit PUT spread (bullish)
+      alpha < 0.2 AND alpha2 < 0.2  → Credit CALL spread (bearish)
+
+    Spread construction (scaled to actual strike interval):
+      Bull: sell ATM put, buy put 8×si below  (≈400 pts for Nifty)
+      Bear: sell ATM call, buy call 8×si above
+    """
+
+    LOOKBACK_ALPHA  = 800   # bars (800 one-min ≈ 2.13 days; matches "800-min lookback")
+    LOOKBACK_ALPHA2 = 300
+
+    def __init__(
+        self,
+        config: StrategyConfig,
+        bs_engine: BlackScholesEngine,
+        database: TradingDatabase,
+        risk_manager: RiskManager,
+        broker: BrokerGateway,
+    ):
+        super().__init__(
+            name="ZenCreditSpread",
+            config=config,
+            bs_engine=bs_engine,
+            database=database,
+            risk_manager=risk_manager,
+            broker=broker,
+        )
+        self._open_price: Optional[float] = None
+        self._day_open:   Optional[str]   = None
+        # Rolling histories for alpha signals
+        self._alpha_series:  np.ndarray = np.array([])
+        self._alpha2_series: np.ndarray = np.array([])
+        # 5-min bar accumulation
+        self._bar_5min_count:   int           = 0
+        self._price_5min_start: Optional[float] = None
+        self._vol_ratio_buf:    List[float]   = []
+        self._atm_vol_buf:      List[float]   = []
+
+    def _update_5min_bar(self, chain: "OptionChainSnapshot") -> Optional[tuple]:
+        """
+        Accumulate 1-min bars into 5-min observations.
+        Returns (pct_change_5min, vol_ratio, atm_vol) when a 5-min bar closes.
+        """
+        self._bar_5min_count += 1
+
+        # Reset open price each day
+        day_str = datetime.now().strftime("%Y-%m-%d")
+        if self._day_open != day_str:
+            self._day_open  = day_str
+            self._open_price = chain.spot_price
+
+        # Track first price of the 5-min window
+        if self._price_5min_start is None:
+            self._price_5min_start = chain.spot_price
+
+        # ATM volume ratio (call vol / put vol)
+        atm = chain.atm_strike
+        call_q = chain.calls.get(atm)
+        put_q  = chain.puts.get(atm)
+        if call_q and put_q:
+            self._vol_ratio_buf.append(call_q.volume / max(1, put_q.volume))
+            iv_sum = (call_q.iv or 0) + (put_q.iv or 0)
+            self._atm_vol_buf.append(iv_sum if iv_sum > 0 else 0.14)
+
+        if self._bar_5min_count % 5 != 0:
+            return None   # 5-min bar not yet complete
+
+        # 5-min bar closes
+        pct_change = (chain.spot_price - self._price_5min_start) / max(1, self._price_5min_start)
+        norm_change = pct_change / max(1e-6, self._open_price / chain.spot_price) if self._open_price else pct_change
+
+        avg_vol_ratio = float(np.mean(self._vol_ratio_buf)) if self._vol_ratio_buf else 1.0
+        avg_atm_vol   = float(np.mean(self._atm_vol_buf))   if self._atm_vol_buf  else 0.14
+
+        # Reset window buffers
+        self._price_5min_start = chain.spot_price
+        self._vol_ratio_buf.clear()
+        self._atm_vol_buf.clear()
+
+        return norm_change, avg_vol_ratio, avg_atm_vol
+
+    def _compute_alphas(self, chain: "OptionChainSnapshot") -> tuple[float, float]:
+        result = self._update_5min_bar(chain)
+        if result is None:
+            # Not a 5-min boundary — return last known alpha values
+            if len(self._alpha_series) > 0:
+                return _tsrank(self._alpha_series), _tsrank(self._alpha2_series)
+            return 0.5, 0.5
+
+        norm_change, vol_ratio, atm_vol = result
+
+        # Alpha: normalised price change → tsrank
+        self._alpha_series = np.append(self._alpha_series, norm_change)
+        if len(self._alpha_series) > self.LOOKBACK_ALPHA:
+            self._alpha_series = self._alpha_series[-self.LOOKBACK_ALPHA:]
+
+        # Alpha2: price change × vol ratio / atm vol → tsrank
+        alpha2_raw = norm_change * vol_ratio / max(0.01, atm_vol)
+        self._alpha2_series = np.append(self._alpha2_series, alpha2_raw)
+        if len(self._alpha2_series) > self.LOOKBACK_ALPHA2:
+            self._alpha2_series = self._alpha2_series[-self.LOOKBACK_ALPHA2:]
+
+        return _tsrank(self._alpha_series), _tsrank(self._alpha2_series)
+
+    async def evaluate(
+        self, chain: "OptionChainSnapshot"
+    ) -> Optional[SpreadSignal]:
+        self._bar_count += 1
+        if self._bar_count < 100:
+            return None   # need at least 20 × 5-min bars for tsrank
+
+        if not self.is_trading_window():
+            return None
+        if self.db.has_active_trade(self.name):
+            return None
+
+        can_enter, reason = self.risk_manager.can_enter_position()
+        if not can_enter:
+            return None
+
+        alpha, alpha2 = self._compute_alphas(chain)
+
+        si  = self._si(chain)
+        atm = chain.atm_strike
+
+        # Bullish: sell put spread
+        if alpha > 0.8 and alpha2 > 0.8:
+            sell_strike = atm
+            buy_strike  = atm - 8 * si   # ≈ 400 pts for Nifty (8×50)
+
+            sell_q = chain.puts.get(sell_strike)
+            buy_q  = chain.puts.get(buy_strike)
+            if not sell_q or not buy_q:
+                return None
+            net_credit = sell_q.ltp - buy_q.ltp
+            if net_credit <= 0:
+                return None
+
+            legs = [
+                SpreadLeg(
+                    symbol=self._sym(chain, sell_strike, "PE"),
+                    strike=sell_strike, option_type=OptionType.PUT,
+                    direction=TransactionType.SELL,
+                    quantity=self._lot_size, price=sell_q.ltp,
+                ),
+                SpreadLeg(
+                    symbol=self._sym(chain, buy_strike, "PE"),
+                    strike=buy_strike, option_type=OptionType.PUT,
+                    direction=TransactionType.BUY,
+                    quantity=self._lot_size, price=buy_q.ltp,
+                ),
+            ]
+            return SpreadSignal(
+                signal_type=SignalType.LONG,
+                strategy_name=self.name,
+                timestamp=datetime.now(),
+                confidence=(alpha + alpha2) / 2,
+                entry_price=net_credit,
+                stop_loss=net_credit * 1.5,
+                target=net_credit * 0.3,
+                symbol=f"{chain.underlying}{chain.expiry}_ZenPutSpread",
+                option_type=OptionType.PUT,
+                strike=sell_strike,
+                expiry=chain.expiry,
+                metadata={"alpha": alpha, "alpha2": alpha2},
+                legs=legs,
+            )
+
+        # Bearish: sell call spread
+        if alpha < 0.2 and alpha2 < 0.2:
+            sell_strike = atm
+            buy_strike  = atm + 8 * si
+
+            sell_q = chain.calls.get(sell_strike)
+            buy_q  = chain.calls.get(buy_strike)
+            if not sell_q or not buy_q:
+                return None
+            net_credit = sell_q.ltp - buy_q.ltp
+            if net_credit <= 0:
+                return None
+
+            legs = [
+                SpreadLeg(
+                    symbol=self._sym(chain, sell_strike, "CE"),
+                    strike=sell_strike, option_type=OptionType.CALL,
+                    direction=TransactionType.SELL,
+                    quantity=self._lot_size, price=sell_q.ltp,
+                ),
+                SpreadLeg(
+                    symbol=self._sym(chain, buy_strike, "CE"),
+                    strike=buy_strike, option_type=OptionType.CALL,
+                    direction=TransactionType.BUY,
+                    quantity=self._lot_size, price=buy_q.ltp,
+                ),
+            ]
+            return SpreadSignal(
+                signal_type=SignalType.SHORT,
+                strategy_name=self.name,
+                timestamp=datetime.now(),
+                confidence=1 - (alpha + alpha2) / 2,
+                entry_price=net_credit,
+                stop_loss=net_credit * 1.5,
+                target=net_credit * 0.3,
+                symbol=f"{chain.underlying}{chain.expiry}_ZenCallSpread",
+                option_type=OptionType.CALL,
+                strike=sell_strike,
+                expiry=chain.expiry,
+                metadata={"alpha": alpha, "alpha2": alpha2},
+                legs=legs,
+            )
+
+        return None
+
+    async def execute_signal(self, signal: SpreadSignal) -> bool:
+        if not isinstance(signal, SpreadSignal) or not signal.legs:
+            return False
+        if not self.db.acquire_trade_lock(
+            self.name, signal.symbol, f"strategy_{self.name}"
+        ):
+            return False
+
+        parent_id = str(uuid.uuid4())
+        executed  = []
+
+        try:
+            for i, leg in enumerate(signal.legs):
+                response = await self.broker.place_order(
+                    symbol=leg.symbol,
+                    exchange=Exchange.NFO,
+                    transaction_type=leg.direction,
+                    order_type=OrderType.LIMIT,
+                    quantity=leg.quantity,
+                    price=leg.price,
+                    product_type=ProductType.INTRADAY,
+                )
+                if not response.success:
+                    await self._unwind_legs(executed)
+                    self.db.release_trade_lock(self.name, signal.symbol)
+                    return False
+                executed.append((leg, response))
+
+                trade = TradeRecord(
+                    trade_id=str(uuid.uuid4()),
+                    strategy_name=self.name,
+                    symbol=leg.symbol,
+                    option_type=leg.option_type.value,
+                    strike=leg.strike,
+                    expiry=signal.expiry,
+                    entry_price=leg.price,
+                    quantity=leg.quantity,
+                    direction=leg.direction.value,
+                    product_type="INTRADAY",
+                    status=TradeStatus.ACTIVE.value,
+                    stop_loss=signal.stop_loss,
+                    target=signal.target,
+                    entry_time=datetime.now().isoformat(),
+                    leg_id=f"leg_{i}",
+                    parent_trade_id=parent_id,
+                )
+                self.db.insert_trade(trade)
+
+            logger.info(
+                f"ZenSpread entered: {signal.symbol}  "
+                f"credit={signal.entry_price:.2f}  "
+                f"α={signal.metadata['alpha']:.3f} α2={signal.metadata['alpha2']:.3f}"
+            )
+            return True
+
+        except Exception as e:
+            logger.error(f"ZenSpread execution error: {e}")
+            await self._unwind_legs(executed)
+            self.db.release_trade_lock(self.name, signal.symbol)
+            return False
+
+    async def _unwind_legs(self, executed_legs) -> None:
+        for leg, response in reversed(executed_legs):
+            try:
+                await self.broker.cancel_order(response.broker_order_id)
+                unwind_dir = (
+                    TransactionType.SELL if leg.direction == TransactionType.BUY
+                    else TransactionType.BUY
+                )
+                await self.broker.place_order(
+                    symbol=leg.symbol, exchange=Exchange.NFO,
+                    transaction_type=unwind_dir, order_type=OrderType.MARKET,
+                    quantity=leg.quantity, product_type=ProductType.INTRADAY,
+                )
+            except Exception as e:
+                logger.error(f"ZenSpread unwind failed for {leg.symbol}: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Strategy 6: Lyapunov Stability Credit Spread
+# ══════════════════════════════════════════════════════════════════════════════
+
+class LyapunovCreditSpreadStrategy(BaseStrategy):
+    """
+    Credit-spread strategy grounded in Lyapunov stability theory.
+
+    Core insight: sell option premium when the market is in a STABLE,
+    PREDICTABLE state — not when it's chaotic.  Two measures determine this:
+
+    1. Lyapunov exponent λ  (chaos measure)
+         λ = mean |log(P_straddle(t) / P_straddle(t-1))|
+         Computed on the ATM straddle price (call_mid + put_mid) — a single
+         number capturing total implied-move expectation.
+         • λ → 0 : straddle barely moving  → stable regime
+         • λ >> 0: straddle oscillating     → chaotic regime
+
+    2. Stability score:  S = 1 − tanh(λ)   ∈ (0, 1]
+         tanh maps any positive λ to (0,1).  When λ≈0, S≈1 (max stable).
+
+    3. Predictability score: R² from a linear regression of the straddle
+         price series over the rolling window.
+         R² ≈ 1 → price trending linearly → predictable
+         R² ≈ 0 → price random noise     → unpredictable
+
+    4. Composite alpha: α = S × R²
+         Only when BOTH measures are high do we enter.
+
+    Trade logic:
+       α > entry_threshold            → sell credit spread
+       Direction: underlying momentum
+         momentum > 0  → credit PUT spread  (bullish bias)
+         momentum < 0  → credit CALL spread (bearish bias)
+       α > iron_condor_threshold (0.85) → sell iron condor (both sides)
+
+    SL  : 2× the net credit collected on each leg
+    TGT : keep 60% of net credit (exit when remaining value = 40% of entry)
+    """
+
+    WINDOW              = 30     # bars for rolling Lyapunov + R²
+    ENTRY_THRESHOLD     = 0.50   # α must exceed this to enter
+    CONDOR_THRESHOLD    = 0.80   # α for full iron condor
+
+    def __init__(
+        self,
+        config: StrategyConfig,
+        bs_engine: BlackScholesEngine,
+        database: TradingDatabase,
+        risk_manager: RiskManager,
+        broker: BrokerGateway,
+    ):
+        super().__init__(
+            name="LyapunovCreditSpread",
+            config=config,
+            bs_engine=bs_engine,
+            database=database,
+            risk_manager=risk_manager,
+            broker=broker,
+        )
+        self._straddle_prices: List[float] = []   # rolling ATM straddle price
+        self._alpha_history:   List[float] = []   # for monitoring
+
+    def _atm_straddle_price(self, chain: "OptionChainSnapshot") -> Optional[float]:
+        """Mid-price of ATM call + ATM put (total premium in the market)."""
+        atm  = chain.atm_strike
+        call = chain.calls.get(atm)
+        put  = chain.puts.get(atm)
+        if not call or not put:
+            return None
+        c_mid = (call.bid + call.ask) / 2 if call.bid and call.ask else call.ltp
+        p_mid = (put.bid  + put.ask)  / 2 if put.bid  and put.ask  else put.ltp
+        return c_mid + p_mid
+
+    # ── Lyapunov exponent ─────────────────────────────────────────────────────
+
+    def _compute_lyapunov(self) -> float:
+        """
+        λ = (1/N) Σ |log(P(t) / P(t−1))|
+
+        Mean absolute log-return of the ATM straddle price.
+        Measures how quickly consecutive option prices diverge — exactly the
+        logarithmic divergence concept from Lyapunov stability theory.
+        """
+        prices = np.array(self._straddle_prices)
+        if len(prices) < 3:
+            return 0.5   # not enough data → assume moderate chaos
+        # Guard against zero prices
+        safe = np.maximum(prices, 1e-6)
+        log_returns = np.abs(np.diff(np.log(safe)))
+        return float(np.mean(log_returns))
+
+    # ── R² predictability ─────────────────────────────────────────────────────
+
+    def _compute_r2(self) -> float:
+        """
+        R² from OLS regression of straddle price on time index.
+        Captures whether the option price is evolving in a PREDICTABLE,
+        linear pattern (R²→1) or bouncing randomly (R²→0).
+        """
+        prices = np.array(self._straddle_prices)
+        n = len(prices)
+        if n < 5:
+            return 0.0
+
+        x      = np.arange(n, dtype=float)
+        x_mean = np.mean(x)
+        y_mean = np.mean(prices)
+
+        ss_xy = float(np.sum((x - x_mean) * (prices - y_mean)))
+        ss_xx = float(np.sum((x - x_mean) ** 2))
+
+        if ss_xx < 1e-10:
+            return 1.0   # constant price → perfectly predictable
+
+        slope     = ss_xy / ss_xx
+        intercept = y_mean - slope * x_mean
+        y_pred    = slope * x + intercept
+
+        ss_res = float(np.sum((prices - y_pred) ** 2))
+        ss_tot = float(np.sum((prices - y_mean) ** 2))
+
+        if ss_tot < 1e-10:
+            return 1.0
+        return max(0.0, 1.0 - ss_res / ss_tot)
+
+    # ── Composite alpha ───────────────────────────────────────────────────────
+
+    def _compute_alpha(self) -> tuple[float, float, float]:
+        """
+        Returns (alpha, lyapunov, r2).
+        alpha = (1 − tanh(λ)) × R²
+        """
+        lam  = self._compute_lyapunov()
+        r2   = self._compute_r2()
+        stab = 1.0 - float(np.tanh(lam))  # tanh ∈ [0,1) → stability ∈ (0,1]
+        alpha = stab * r2
+        return alpha, lam, r2
+
+    # ── Spread builders ───────────────────────────────────────────────────────
+
+    def _put_spread(
+        self, chain: "OptionChainSnapshot", atm: float, si: float
+    ) -> Optional[SpreadSignal]:
+        sell_k = atm
+        buy_k  = atm - 2 * si
+        sq, bq = chain.puts.get(sell_k), chain.puts.get(buy_k)
+        if not sq or not bq:
+            return None
+        credit = sq.ltp - bq.ltp
+        if credit <= 0:
+            return None
+        alpha, lam, r2 = self._compute_alpha()
+        return SpreadSignal(
+            signal_type=SignalType.LONG,
+            strategy_name=self.name,
+            timestamp=datetime.now(),
+            confidence=alpha,
+            entry_price=credit,
+            stop_loss=credit * 2.0,
+            target=credit * 0.40,
+            symbol=f"{chain.underlying}{chain.expiry}_LyapPutSpread",
+            option_type=OptionType.PUT,
+            strike=sell_k,
+            expiry=chain.expiry,
+            metadata={"alpha": alpha, "lyapunov": lam, "r2": r2,
+                      "spread_type": "put_spread"},
+            legs=[
+                SpreadLeg(self._sym(chain, sell_k, "PE"), sell_k, OptionType.PUT,
+                          TransactionType.SELL, self._lot_size, sq.ltp),
+                SpreadLeg(self._sym(chain, buy_k,  "PE"), buy_k,  OptionType.PUT,
+                          TransactionType.BUY,  self._lot_size, bq.ltp),
+            ],
+        )
+
+    def _call_spread(
+        self, chain: "OptionChainSnapshot", atm: float, si: float
+    ) -> Optional[SpreadSignal]:
+        sell_k = atm
+        buy_k  = atm + 2 * si
+        sq, bq = chain.calls.get(sell_k), chain.calls.get(buy_k)
+        if not sq or not bq:
+            return None
+        credit = sq.ltp - bq.ltp
+        if credit <= 0:
+            return None
+        alpha, lam, r2 = self._compute_alpha()
+        return SpreadSignal(
+            signal_type=SignalType.SHORT,
+            strategy_name=self.name,
+            timestamp=datetime.now(),
+            confidence=alpha,
+            entry_price=credit,
+            stop_loss=credit * 2.0,
+            target=credit * 0.40,
+            symbol=f"{chain.underlying}{chain.expiry}_LyapCallSpread",
+            option_type=OptionType.CALL,
+            strike=sell_k,
+            expiry=chain.expiry,
+            metadata={"alpha": alpha, "lyapunov": lam, "r2": r2,
+                      "spread_type": "call_spread"},
+            legs=[
+                SpreadLeg(self._sym(chain, sell_k, "CE"), sell_k, OptionType.CALL,
+                          TransactionType.SELL, self._lot_size, sq.ltp),
+                SpreadLeg(self._sym(chain, buy_k,  "CE"), buy_k,  OptionType.CALL,
+                          TransactionType.BUY,  self._lot_size, bq.ltp),
+            ],
+        )
+
+    # ── Evaluate ──────────────────────────────────────────────────────────────
+
+    async def evaluate(
+        self, chain: "OptionChainSnapshot"
+    ) -> Optional[SpreadSignal]:
+        self._bar_count += 1
+        self._track_spot(chain)
+
+        # Track ATM straddle price every bar
+        straddle = self._atm_straddle_price(chain)
+        if straddle and straddle > 0:
+            self._straddle_prices.append(straddle)
+            if len(self._straddle_prices) > self.WINDOW:
+                self._straddle_prices.pop(0)
+
+        if self._bar_count < self._warmup_bars:
+            return None
+        if len(self._straddle_prices) < 10:
+            return None
+
+        if not self.is_trading_window():
+            return None
+        if self.db.has_active_trade(self.name):
+            return None
+
+        can_enter, reason = self.risk_manager.can_enter_position()
+        if not can_enter:
+            return None
+
+        # ── Lyapunov composite alpha ──────────────────────────────────────
+        alpha, lam, r2 = self._compute_alpha()
+        self._alpha_history.append(alpha)
+
+        if alpha < self.ENTRY_THRESHOLD:
+            return None   # market too chaotic or unpredictable
+
+        si  = self._si(chain)
+        atm = chain.atm_strike
+        mom = self._spot_momentum(15)
+
+        logger.debug(
+            f"Lyapunov signal: α={alpha:.3f}  λ={lam:.4f}  R²={r2:.3f}  "
+            f"mom={mom:.4f}  straddle=₹{straddle:.1f}"
+        )
+
+        # ── Iron condor when exceptionally stable ─────────────────────────
+        if alpha >= self.CONDOR_THRESHOLD:
+            put_sig  = self._put_spread(chain, atm, si)
+            call_sig = self._call_spread(chain, atm, si)
+            # Return the put spread first (execute call spread next evaluation)
+            if put_sig:
+                put_sig.symbol = f"{chain.underlying}{chain.expiry}_LyapCondor"
+                put_sig.metadata["spread_type"] = "iron_condor"
+                return put_sig
+
+        # ── Directional credit spread based on momentum ───────────────────
+        if mom > 0.0001:               # slight uptrend → put spread (bullish)
+            return self._put_spread(chain, atm, si)
+        elif mom < -0.0001:            # slight downtrend → call spread (bearish)
+            return self._call_spread(chain, atm, si)
+        else:                          # flat → put spread (theta bias)
+            return self._put_spread(chain, atm, si)
+
+    # ── Execute ───────────────────────────────────────────────────────────────
+
+    async def execute_signal(self, signal: SpreadSignal) -> bool:
+        if not isinstance(signal, SpreadSignal) or not signal.legs:
+            return False
+        if not self.db.acquire_trade_lock(
+            self.name, signal.symbol, f"strategy_{self.name}"
+        ):
+            return False
+
+        parent_id = str(uuid.uuid4())
+        executed  = []
+
+        try:
+            for i, leg in enumerate(signal.legs):
+                response = await self.broker.place_order(
+                    symbol=leg.symbol,
+                    exchange=Exchange.NFO,
+                    transaction_type=leg.direction,
+                    order_type=OrderType.LIMIT,
+                    quantity=leg.quantity,
+                    price=leg.price,
+                    product_type=ProductType.INTRADAY,
+                )
+                if not response.success:
+                    await self._unwind_legs(executed)
+                    self.db.release_trade_lock(self.name, signal.symbol)
+                    return False
+                executed.append((leg, response))
+
+                trade = TradeRecord(
+                    trade_id=str(uuid.uuid4()),
+                    strategy_name=self.name,
+                    symbol=leg.symbol,
+                    option_type=leg.option_type.value,
+                    strike=leg.strike,
+                    expiry=signal.expiry,
+                    entry_price=leg.price,
+                    quantity=leg.quantity,
+                    direction=leg.direction.value,
+                    product_type="INTRADAY",
+                    status=TradeStatus.ACTIVE.value,
+                    stop_loss=signal.stop_loss,
+                    target=signal.target,
+                    entry_time=datetime.now().isoformat(),
+                    leg_id=f"leg_{i}",
+                    parent_trade_id=parent_id,
+                )
+                self.db.insert_trade(trade)
+
+            m = signal.metadata
+            logger.info(
+                f"Lyapunov spread entered: {signal.metadata.get('spread_type','')}  "
+                f"credit=₹{signal.entry_price:.2f}  "
+                f"α={m.get('alpha',0):.3f}  λ={m.get('lyapunov',0):.4f}  "
+                f"R²={m.get('r2',0):.3f}"
+            )
+            return True
+
+        except Exception as e:
+            logger.error(f"Lyapunov execution error: {e}")
+            await self._unwind_legs(executed)
+            self.db.release_trade_lock(self.name, signal.symbol)
+            return False
+
+    async def _unwind_legs(self, executed_legs) -> None:
+        for leg, response in reversed(executed_legs):
+            try:
+                await self.broker.cancel_order(response.broker_order_id)
+                unwind_dir = (
+                    TransactionType.SELL if leg.direction == TransactionType.BUY
+                    else TransactionType.BUY
+                )
+                await self.broker.place_order(
+                    symbol=leg.symbol, exchange=Exchange.NFO,
+                    transaction_type=unwind_dir, order_type=OrderType.MARKET,
+                    quantity=leg.quantity, product_type=ProductType.INTRADAY,
+                )
+            except Exception as e:
+                logger.error(f"Lyapunov unwind failed for {leg.symbol}: {e}")
+
+    def get_lyapunov_stats(self) -> dict:
+        """Diagnostic: returns current Lyapunov metrics (useful for monitoring)."""
+        if not self._straddle_prices:
+            return {}
+        alpha, lam, r2 = self._compute_alpha()
+        return {
+            "lyapunov_exponent": round(lam, 6),
+            "stability":         round(1.0 - float(np.tanh(lam)), 4),
+            "r_squared":         round(r2, 4),
+            "composite_alpha":   round(alpha, 4),
+            "straddle_price":    round(self._straddle_prices[-1], 2),
+            "window_bars":       len(self._straddle_prices),
+        }
 

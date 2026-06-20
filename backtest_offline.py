@@ -256,12 +256,17 @@ class OfflineChainBuilder:
             c_iv = float(c_iv_arr[idx_j]); p_iv = float(p_iv_arr[idx_j])
             c_px = float(c_px_arr[idx_j]); p_px = float(p_px_arr[idx_j])
 
+            # Bias-driven bid/ask differentiation (non-zero viscosity for Curvature)
+            b_bid = max(0.3, 1.0 + 0.4 * self._bias)
+            b_ask = max(0.3, 1.0 - 0.3 * self._bias)
+
             snap.calls[float(strike)] = OptionQuote(
                 symbol=f"{pfx}{exp_str}{int(strike)}CE", strike=float(strike),
                 expiry=exp_str, option_type=OptionType.CALL,
                 ltp=round(c_px,2), bid=round(c_px*(1-spread),2),
                 ask=round(c_px*(1+spread),2),
-                bid_qty=c_vol, ask_qty=c_vol, volume=c_vol*10, oi=c_oi,
+                bid_qty=max(10, int(c_vol*b_bid)), ask_qty=max(10, int(c_vol*b_ask)),
+                volume=c_vol*10, oi=c_oi,
                 iv=c_iv, delta=float(c_dl_arr[idx_j]),
             )
             snap.puts[float(strike)] = OptionQuote(
@@ -269,7 +274,8 @@ class OfflineChainBuilder:
                 expiry=exp_str, option_type=OptionType.PUT,
                 ltp=round(p_px,2), bid=round(p_px*(1-spread),2),
                 ask=round(p_px*(1+spread),2),
-                bid_qty=p_vol, ask_qty=p_vol, volume=p_vol*10, oi=p_oi,
+                bid_qty=max(10, int(p_vol*b_ask)), ask_qty=max(10, int(p_vol*b_bid)),
+                volume=p_vol*10, oi=p_oi,
                 iv=p_iv, delta=float(p_dl_arr[idx_j]),
             )
 
@@ -377,13 +383,57 @@ def trading_tte(now: datetime, expiry_dt: datetime) -> float:
 # 5.  Performance report
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _strat_metrics(pnls: list, initial_capital: float = 500_000) -> dict:
+    wins   = [p for p in pnls if p > 0]
+    losses = [p for p in pnls if p <= 0]
+    wr     = len(wins) / max(1, len(pnls)) * 100
+    aw     = float(np.mean(wins))   if wins   else 0.0
+    al     = float(np.mean(losses)) if losses else 0.0
+    pf     = sum(wins) / abs(sum(losses)) if wins and losses else float("inf")
+    exp    = (wr / 100 * aw) + ((1 - wr / 100) * al)
+    # Drawdown as % of initial capital so it's comparable to portfolio-level DD
+    cap = peak = initial_capital; dd = 0.0
+    for p in pnls:
+        cap += p; peak = max(peak, cap)
+        dd = max(dd, (peak - cap) / peak * 100)
+    return dict(total=sum(pnls), trades=len(pnls), wr=wr,
+                avg_win=aw, avg_loss=al, pf=pf, exp=exp, max_dd=dd)
+
+
+def _print_strat_block(sname: str, rows: list, m: dict,
+                        initial_capital: float) -> None:
+    W = 54
+    print(f"\n  ┌{'─'*W}┐")
+    print(f"  │  {sname:<{W-2}}│")
+    print(f"  ├{'─'*W}┤")
+    print(f"  │  Trades        : {m['trades']:<35}│")
+    print(f"  │  Win Rate      : {m['wr']:.1f} %{'':<30}│")
+    print(f"  │  Avg Win       : ₹{m['avg_win']:>10,.0f}{'':<22}│")
+    print(f"  │  Avg Loss      : ₹{m['avg_loss']:>10,.0f}{'':<22}│")
+    if m['avg_loss'] != 0:
+        rr = f"{abs(m['avg_win']/m['avg_loss']):.2f} : 1"
+        print(f"  │  Actual RR     : {rr:<35}│")
+    print(f"  │  Profit Factor : {m['pf']:.2f}{'':<31}│")
+    print(f"  │  Expectancy    : ₹{m['exp']:>10,.0f} / trade{'':<13}│")
+    pnl_s = f"₹{m['total']:>10,.0f}  ({m['total']/initial_capital*100:+.2f}%)"
+    print(f"  │  Total P&L     : {pnl_s:<35}│")
+    print(f"  │  Max Drawdown  : {m['max_dd']:.2f} %{'':<29}│")
+    reasons: dict = {}
+    for r in rows:
+        k = r["exit_reason"] or "UNKNOWN"
+        reasons[k] = reasons.get(k, 0) + 1
+    print(f"  └{'─'*W}┘")
+    for k, v in sorted(reasons.items()):
+        print(f"      {k}: {v} trades")
+
+
 def _report(
     db: TradingDatabase,
     label: str,
     initial_capital: float,
     output_csv: Optional[str] = None,
 ) -> dict:
-    """Print a formatted report and return summary dict."""
+    """Print overall + per-strategy full metrics, save CSVs, return summary."""
     conn = db._get_connection()
     rows = conn.execute(
         "SELECT * FROM trades "
@@ -391,73 +441,73 @@ def _report(
         "ORDER BY exit_time"
     ).fetchall()
 
-    pnls   = [r["pnl"] for r in rows if r["pnl"] is not None]
-    wins   = [p for p in pnls if p > 0]
-    losses = [p for p in pnls if p <= 0]
-
-    if not pnls:
+    all_pnls = [r["pnl"] for r in rows if r["pnl"] is not None]
+    if not all_pnls:
         print(f"\n  [{label}]  No closed trades.\n")
         return {}
 
-    total_pnl = sum(pnls)
-    wr        = len(wins) / len(pnls) * 100
-    avg_w     = float(np.mean(wins))   if wins   else 0.0
-    avg_l     = float(np.mean(losses)) if losses else 0.0
-    pf        = sum(wins) / abs(sum(losses)) if wins and losses else float("inf")
-    exp_val   = (wr / 100 * avg_w) + ((1 - wr / 100) * avg_l)
-
-    # Max drawdown from trade sequence
-    cap = peak = initial_capital
-    max_dd = 0.0
-    for p in pnls:
-        cap  += p
-        peak  = max(peak, cap)
-        max_dd = max(max_dd, (peak - cap) / peak * 100)
-
+    m = _strat_metrics(all_pnls)
     W = 56
     bar = "═" * W
     print(f"\n{bar}")
     print(f"  {label}")
     print(bar)
-    print(f"  Capital         ₹{initial_capital:>12,.0f}  →  ₹{initial_capital+total_pnl:>12,.0f}")
-    print(f"  Total P&L     : ₹{total_pnl:>10,.0f}  ({total_pnl/initial_capital*100:+.2f} %)")
-    print(f"  Total Trades  : {len(pnls)}")
-    print(f"  Win Rate      : {wr:.1f} %")
-    print(f"  Avg Win       : ₹{avg_w:>9,.0f}    Avg Loss : ₹{avg_l:>9,.0f}")
-    if avg_l != 0:
-        print(f"  Actual RR     : {abs(avg_w/avg_l):.2f} : 1")
-    print(f"  Profit Factor : {pf:.2f}")
-    print(f"  Expectancy    : ₹{exp_val:>9,.0f} / trade")
-    print(f"  Max Drawdown  : {max_dd:.2f} %")
+    print(f"  Capital  ₹{initial_capital:>12,.0f}  →  ₹{initial_capital+m['total']:>12,.0f}")
+    print(f"  Trades={m['trades']}  WinRate={m['wr']:.1f}%  PF={m['pf']:.2f}  "
+          f"MaxDD={m['max_dd']:.2f}%")
+    print(f"  P&L  ₹{m['total']:>10,.0f}  ({m['total']/initial_capital*100:+.2f}%)  "
+          f"Expectancy ₹{m['exp']:,.0f}/trade")
     print(bar)
 
-    # Per-strategy breakdown
-    strats = sorted({r["strategy_name"] for r in rows})
-    for s in strats:
-        sp  = [r["pnl"] for r in rows if r["strategy_name"] == s and r["pnl"] is not None]
-        sw  = sum(1 for x in sp if x > 0)
-        print(f"  [{s}]  trades={len(sp):3d}  wins={sw:3d}  "
-              f"wr={sw/max(1,len(sp))*100:5.1f}%  pnl=₹{sum(sp):>9,.0f}")
+    # Full per-strategy breakdown
+    strat_names = sorted({r["strategy_name"] for r in rows})
+    strat_summaries: dict = {}
+    if strat_names:
+        print(f"\n  PER-STRATEGY BREAKDOWN")
+        for sname in strat_names:
+            s_rows = [r for r in rows if r["strategy_name"] == sname]
+            s_pnls = [r["pnl"] for r in s_rows if r["pnl"] is not None]
+            if not s_pnls:
+                continue
+            sm = _strat_metrics(s_pnls, initial_capital)
+            strat_summaries[sname] = sm
+            _print_strat_block(sname, s_rows, sm, initial_capital)
     print()
 
+    # CSVs
+    fields = [
+        "strategy_name", "symbol", "option_type", "strike", "direction",
+        "entry_time", "exit_time", "entry_price", "exit_price",
+        "quantity", "pnl", "exit_reason",
+    ]
     if output_csv:
         with open(output_csv, "w", newline="") as f:
-            fields = [
-                "strategy_name","symbol","option_type","strike","direction",
-                "entry_time","exit_time","entry_price","exit_price",
-                "quantity","pnl","exit_reason",
-            ]
             w = csv.DictWriter(f, fieldnames=fields)
             w.writeheader()
             for r in rows:
                 w.writerow({k: r[k] for k in fields})
-        print(f"  Trade log → {output_csv}\n")
+        print(f"  [All strategies] → {output_csv}")
+        base = output_csv.replace(".csv", "")
+        for sname in strat_names:
+            s_rows = [r for r in rows if r["strategy_name"] == sname]
+            spath  = f"{base}_{sname.replace(' ', '_')}.csv"
+            with open(spath, "w", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=fields)
+                w.writeheader()
+                for r in s_rows:
+                    w.writerow({k: r[k] for k in fields})
+            print(f"  [{sname}]       → {spath}")
+        print()
 
     return {
-        "label": label, "total_pnl": total_pnl,
-        "trades": len(pnls), "win_rate": wr,
-        "profit_factor": pf, "max_dd": max_dd,
-        "return_pct": total_pnl / initial_capital * 100,
+        "label":         label,
+        "total_pnl":     m["total"],
+        "trades":        m["trades"],
+        "win_rate":      m["wr"],
+        "profit_factor": m["pf"],
+        "max_dd":        m["max_dd"],
+        "return_pct":    m["total"] / initial_capital * 100,
+        "by_strategy":   strat_summaries,
     }
 
 
@@ -507,6 +557,11 @@ async def _run_one(
         skewhunter_alpha1_short=0.38,
         skewhunter_alpha2_short=0.40,
     )
+    # Silence noisy-but-expected backtest warnings
+    import logging as _logging
+    for _ln in ("trading_system.db_lock", "trading_system.risk_manager"):
+        _logging.getLogger(_ln).setLevel(_logging.ERROR)
+
     strat_fixed    = FixedRR13Strategy(cfg, bs, db, risk, broker)
     strat_curv     = CurvatureCreditSpreadStrategy(cfg, bs, db, risk, broker)
     strat_skew     = SkewHunterStrategy(cfg, bs, db, risk, broker)
@@ -535,6 +590,12 @@ async def _run_one(
         expiry_dt = nearest_expiry(
             datetime.combine(day, dt_time(9, 15)), spec.expiry_weekday
         )
+
+        # Reset daily counters at the start of each simulated trading day
+        with risk._lock:
+            risk._metrics.realized_pnl       = 0.0
+            risk._metrics.unrealized_pnl     = 0.0
+            risk._metrics.daily_loss_percent = 0.0
 
         for bar in day_bars:
             ts       = bar["timestamp"]
@@ -585,6 +646,7 @@ async def _run_one(
                     dm  = 1 if trade.direction == "BUY" else -1
                     pnl = (px - trade.entry_price) * trade.quantity * dm
                     risk.remove_position(trade.trade_id, pnl)
+                    db.release_trade_lock(trade.strategy_name, trade.symbol)
 
     label = f"{spec.display_name}  ({len(trading_days)} trading days)"
     return _report(db, label, initial_capital, output_csv)

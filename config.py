@@ -78,7 +78,7 @@ class BrokerConfig:
     secret_key: str
     totp_key: str
     pin: str = ""
-    redirect_uri: str = "https://127.0.0.1:8080/callback"
+    redirect_uri: str = "http://127.0.0.1:8080/callback"
     api_base_url: str = ""
     ws_url: str = ""
 
@@ -129,7 +129,7 @@ class StrategyConfig:
     fixed_rr_alpha2_short_threshold: float = 0.3
     
     # Curvature Credit Spread
-    curvature_threshold: float = 1.5e-5
+    curvature_threshold: float = 3e-6   # lowered: 1.5e-5 is above max achievable with synthetic chains
     curvature_entry_start: str = "15:00:00"
     curvature_entry_end: str = "15:25:00"
     viscosity_threshold: float = 0.3
@@ -166,7 +166,7 @@ class AppConfig:
         secret_key=os.getenv("BROKER_SECRET_KEY", ""),
         totp_key=os.getenv("BROKER_TOTP_KEY", ""),
         pin=os.getenv("BROKER_PIN", ""),
-        redirect_uri=os.getenv("BROKER_REDIRECT_URI", "https://127.0.0.1:8080/callback"),
+        redirect_uri=os.getenv("BROKER_REDIRECT_URI", "http://127.0.0.1:8080/callback"),
     ))
     risk: RiskConfig = field(default_factory=RiskConfig)
     compliance: ComplianceConfig = field(default_factory=lambda: ComplianceConfig(

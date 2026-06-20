@@ -255,7 +255,7 @@ class FyersGateway(BrokerGateway):
                     "fyers_id": self.config.client_id,
                     "app_id": self.config.app_id,
                     "redirect_uri": self.config.redirect_uri,
-                    "appType": "100",
+                    "appType": self.config.app_id.split("-")[-1],  # e.g. "200" from "XXXX-200"
                     "code_challenge": "",
                     "state": "None",
                     "scope": "",
