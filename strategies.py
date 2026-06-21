@@ -88,9 +88,20 @@ class BaseStrategy(ABC):
         self._is_active = True
         self._last_signal_time: Optional[datetime] = None
         self._bars: Dict[str, List[OHLCV]] = {}
-        self._bar_count: int = 0          # for warmup tracking
-        self._warmup_bars: int = 60       # 1 hour before first signal
-        self._spot_prices: List[float] = []  # real underlying price history (from chain)
+        self._bar_count: int = 0
+        self._warmup_bars: int = 60
+        self._spot_prices: List[float] = []
+        # OHLC history for strategies that need ATR / high / low (e.g. CompressionBreakout)
+        self._ohlc_bars: List[tuple] = []  # (close, high, low)
+
+    def _track_ohlc(self, close: float, high: float, low: float) -> None:
+        """Record per-bar OHLC. Called from backtest loop for each 1-min bar."""
+        self._ohlc_bars.append((float(close), float(high), float(low)))
+        self._spot_prices.append(float(close))
+        if len(self._ohlc_bars) > 300:
+            self._ohlc_bars.pop(0)
+        if len(self._spot_prices) > 300:
+            self._spot_prices.pop(0)
 
     # NSE F&O underlyings → NFO segment; BSE F&O underlyings → BFO segment
     _NSE_UNDERLYINGS = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"}
@@ -108,9 +119,13 @@ class BaseStrategy(ABC):
         return float(np.mean(ivs)) if ivs else 0.14
 
     def _vix_ok(self, chain: "OptionChainSnapshot") -> bool:
-        """Only trade when ATM IV implies VIX in the 10–22% range."""
+        """
+        Only trade when ATM IV is in a viable range.
+        Floor lowered 10→8%: 2026 data shows VIX hitting 9.2% which blocked
+        the entire Jan 2026 period and caused 0-trade starvation.
+        """
         vix_pct = self._atm_iv(chain) * 100
-        return 10.0 <= vix_pct <= 22.0
+        return 8.0 <= vix_pct <= 25.0
 
     def _track_spot(self, chain: "OptionChainSnapshot") -> None:
         """Record spot price every bar for momentum calculations."""
@@ -165,6 +180,17 @@ class BaseStrategy(ABC):
             lot_size=self._lot_size,
             is_hedged=is_hedged,
         )
+
+    @staticmethod
+    def _closest_strike(quotes: dict, target: float) -> Optional[float]:
+        """
+        Fix 3: Robust strike selector — finds the actual nearest key in the
+        chain dict rather than relying on float arithmetic to match exactly.
+        Prevents hidden KeyErrors from floating-point rounding mismatches.
+        """
+        if not quotes:
+            return None
+        return min(quotes.keys(), key=lambda k: abs(float(k) - target))
 
     def _si(self, chain: "OptionChainSnapshot") -> float:
         """
@@ -628,11 +654,14 @@ class FixedRR13Strategy(BaseStrategy):
         alpha2: float,
         e_diff: float
     ) -> Optional[StrategySignal]:
-        """Buy the first OTM call above ATM. SL=30%, Target=90% → 1:3 RR."""
-        above = sorted(k for k in chain.calls if k > chain.atm_strike)
-        if not above:
+        """
+        Phase 2+Fix3: Buy ATM call using robust closest-strike lookup.
+        Eliminates KeyError from float rounding mismatches.
+        """
+        # Fix 3: use actual nearest key, not assumed float match
+        strike = self._closest_strike(chain.calls, chain.atm_strike)
+        if strike is None:
             return None
-        strike = above[0]
         quote = chain.calls.get(strike)
         if not quote or not quote.ltp or quote.ltp < self.config.min_premium:
             return None
@@ -664,11 +693,10 @@ class FixedRR13Strategy(BaseStrategy):
         alpha2: float,
         e_diff: float
     ) -> Optional[StrategySignal]:
-        """Buy the first OTM put below ATM. SL=30%, Target=90% → 1:3 RR."""
-        below = sorted((k for k in chain.puts if k < chain.atm_strike), reverse=True)
-        if not below:
+        """Phase 2+Fix3: Buy ATM put using robust closest-strike lookup."""
+        strike = self._closest_strike(chain.puts, chain.atm_strike)
+        if strike is None:
             return None
-        strike = below[0]
         quote = chain.puts.get(strike)
         if not quote or not quote.ltp or quote.ltp < self.config.min_premium:
             return None
@@ -1345,20 +1373,21 @@ class SkewHunterStrategy(BaseStrategy):
         put_skew  = otm_put_iv  - itm_put_iv
         net_skew  = call_skew - put_skew
 
-        # ── Rolling z-score normalization ─────────────────────────────────
-        # The raw net_skew with a synthetic chain is nearly constant (~-0.01
-        # to -0.03).  Fixed-scale sigmoid would always return ~0.35.
-        # Z-score makes alpha2 dynamic: it fires when the skew is at an
-        # EXTREME relative to its own recent history (the correct quant signal).
+        # ── Directional skew signal (fixed scale, cross-day reference) ────
+        # Root cause of 0 trades: z-score of net_skew within a 60-bar
+        # intraday window gives z≈0 always (calibrated IV barely changes intraday).
+        # Fix: track a CROSS-DAY rolling window (200 bars = ~1 week) so the
+        # z-score has genuine variance from day-to-day skew changes.
         self._alpha2_history.append(net_skew)
-        if len(self._alpha2_history) > 60:
+        if len(self._alpha2_history) > 200:
             self._alpha2_history.pop(0)
-        if len(self._alpha2_history) < 10:
+        if len(self._alpha2_history) < 20:
             return 0.5
         hist = np.array(self._alpha2_history)
         std  = np.std(hist)
-        if std < 1e-12:
-            return 0.5
+        if std < 1e-10:
+            # No variance at all — use sign-based signal instead
+            return 0.6 if net_skew > 0 else 0.4
         z = (net_skew - np.mean(hist)) / std
         return float(1 / (1 + np.exp(-z)))
     
@@ -1395,30 +1424,23 @@ class SkewHunterStrategy(BaseStrategy):
         # LONG: call volume > 1.25× put volume AND skew confirming bullish move.
         if (alpha1 > self.config.skewhunter_volume_ratio_long and
                 alpha2 > self.config.z_score_long_threshold):
-
-            above = sorted(k for k in chain.calls if k > atm)
-            if above:
-                target_strike = above[0]
+            # Fix 3: robust closest-strike lookup — no more hidden KeyErrors
+            target_strike = self._closest_strike(chain.calls, atm)
+            if target_strike is not None:
                 quote = chain.calls.get(target_strike)
                 if quote and quote.ltp >= self.config.min_premium:
                     return await self._create_long_signal(
-                        chain, quote, target_strike, OptionType.CALL,
-                        alpha1, alpha2
+                        chain, quote, target_strike, OptionType.CALL, alpha1, alpha2
                     )
 
-        # SHORT: put volume > 1.25× call volume AND skew confirming bearish.
-        # alpha2 < (1 - 0.65) = 0.35 mirrors the long threshold symmetrically.
         elif (alpha1 < self.config.skewhunter_volume_ratio_short and
               alpha2 < (1.0 - self.config.z_score_long_threshold)):
-
-            below = sorted((k for k in chain.puts if k < atm), reverse=True)
-            if below:
-                target_strike = below[0]
+            target_strike = self._closest_strike(chain.puts, atm)
+            if target_strike is not None:
                 quote = chain.puts.get(target_strike)
                 if quote and quote.ltp >= self.config.min_premium:
                     return await self._create_long_signal(
-                        chain, quote, target_strike, OptionType.PUT,
-                        alpha1, alpha2
+                        chain, quote, target_strike, OptionType.PUT, alpha1, alpha2
                     )
         
         return None
@@ -1783,7 +1805,7 @@ class ExpiryShortStrangleStrategy(BaseStrategy):
                 # SELL legs: SL fires if premium RISES (loss), target if it falls
                 # BUY  legs: SL fires if premium FALLS (loss), target if it rises
                 if leg.direction == TransactionType.SELL:
-                    sl_price  = leg.price * 2.5   # exit if short leg doubles in value
+                    sl_price  = leg.price * 2.5   # Phase 4: +150% → let 0DTE breathe past micro-whips
                     tgt_price = leg.price * 0.30  # keep 70% of premium collected
                     direction_str = "SELL"
                 else:
@@ -2232,6 +2254,44 @@ class ZenCreditSpreadStrategy(BaseStrategy):
             self.db.release_trade_lock(self.name, signal.symbol)
             return False
 
+    # ── Phase 3: 90-minute time-stop ─────────────────────────────────────────
+
+    async def manage_positions(self) -> None:
+        """
+        Phase 3: 90-minute time-stop eliminates stagnation bleed.
+
+        Debit spreads that sit open too long lose to theta even when "not losing".
+        Rules:
+          > 90 min AND PnL negative → TIME_DECAY_CUT (cut the loss now)
+          > 90 min AND PnL positive → STAGNATION_PROFIT_TAKE (lock in the gain)
+        This converts a floating P&L into a realised one either way.
+        """
+        active = self.db.get_active_trades(self.name)
+        for trade in active:
+            quote = await self.broker.get_quote(trade.symbol, Exchange.NFO)
+            if not quote:
+                continue
+
+            current_price = quote.ltp
+
+            # ── 90-minute time-stop ───────────────────────────────────────
+            if trade.direction == "BUY" and trade.entry_price > 0:
+                try:
+                    entry_dt     = datetime.fromisoformat(trade.entry_time)
+                    mins_open    = (datetime.now() - entry_dt).total_seconds() / 60
+                    pnl_pct      = (current_price - trade.entry_price) / trade.entry_price * 100
+                    if mins_open > 90:
+                        reason = "STAGNATION_PROFIT_TAKE" if pnl_pct >= 0 else "TIME_DECAY_CUT"
+                        await self._execute_exit(trade, current_price, None, reason=reason)
+                        continue
+                except (ValueError, TypeError):
+                    pass
+
+            # ── Standard SL / target ──────────────────────────────────────
+            should_exit, event = self.sl_manager.should_exit(trade.trade_id, current_price)
+            if should_exit:
+                await self._execute_exit(trade, current_price, event)
+
     async def _unwind_legs(self, executed_legs) -> None:
         for leg, response in reversed(executed_legs):
             try:
@@ -2623,3 +2683,326 @@ class LyapunovCreditSpreadStrategy(BaseStrategy):
             "window_bars":       len(self._straddle_prices),
         }
 
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Strategy 7: Compression Breakout
+# ══════════════════════════════════════════════════════════════════════════════
+
+class CompressionBreakoutStrategy(BaseStrategy):
+    """
+    Institutional-grade directional strategy based on variance compression,
+    liquidity sweeps, and explosive breakouts.
+
+    Uses REAL Nifty 1-min OHLC from Fyers — NOT synthetic option chain data.
+    This gives it genuine signal quality unlike strategies that depend on
+    modelled IV/OI.
+
+    Algorithm:
+    ┌─────────────────────────────────────────────────────────────────┐
+    │ 1. SQUEEZE: Bollinger Bands inside Keltner Channel for 5+ bars  │
+    │    (variance has collapsed — energy building for breakout)       │
+    │ 2. SWEEP: Price breaks below 20-period low then recovers in 3   │
+    │    candles (trapped shorts provide liquidity anchor)             │
+    │ 3. ENTRY: Current bar breaks above highest high of last 10 bars │
+    │    → Buy ATM call option                                         │
+    │ 4. TRAIL: SL at sweep low → +40% → breakeven → trail +15%/20%  │
+    └─────────────────────────────────────────────────────────────────┘
+
+    Mathematical underpinning:
+    • BB squeeze = σ → 0 (variance collapse) precedes σ expansion
+    • Liquidity sweep = stop-hunt below support (Smart Money Concepts)
+    • ATR-based Keltner Channel filters noise from BB-only squeezes
+    """
+
+    # ── Indicator parameters ──────────────────────────────────────────────────
+    BB_PERIOD     = 20    # Bollinger Band lookback
+    BB_STD        = 2.0   # standard deviations
+    KC_ATR_MULT   = 2.0   # Fix 1: widened 1.5→2.0 so BB fits inside KC more on 1-min noise
+    ATR_PERIOD    = 14    # True Range smoothing period
+    SQUEEZE_BARS  = 5     # consecutive bars BB must be inside KC
+    SWEEP_LOOKBK  = 20    # period for identifying the key low (sweep target)
+    SWEEP_RECOVER = 10    # Fix 1: widened 3→10 candles to recover (1-min charts need time)
+    BREAKOUT_BARS = 10    # highest high of last N bars = breakout trigger
+
+    def __init__(
+        self,
+        config: StrategyConfig,
+        bs_engine: BlackScholesEngine,
+        database: TradingDatabase,
+        risk_manager: RiskManager,
+        broker: BrokerGateway,
+    ):
+        super().__init__(
+            name="CompressionBreakout",
+            config=config,
+            bs_engine=bs_engine,
+            database=database,
+            risk_manager=risk_manager,
+            broker=broker,
+        )
+        self._squeeze_count:    int            = 0      # consecutive squeeze bars
+        self._sweep_detected:   bool           = False
+        self._sweep_low:        float          = 0.0    # low of the liquidity sweep
+        self._last_signal_day:  Optional[str]  = None   # one trade per day
+
+    # ── Indicator computation ─────────────────────────────────────────────────
+
+    def _compute_atr(self, period: int = 14) -> float:
+        """Average True Range over `period` bars."""
+        bars = self._ohlc_bars[-(period + 1):]
+        if len(bars) < 2:
+            return 0.0
+        trs = []
+        for i in range(1, len(bars)):
+            c, h, l    = bars[i]
+            prev_c     = bars[i - 1][0]
+            tr = max(h - l, abs(h - prev_c), abs(l - prev_c))
+            trs.append(tr)
+        return float(np.mean(trs)) if trs else 0.0
+
+    def _compute_bb_kc(self) -> Optional[tuple]:
+        """
+        Returns (bb_upper, bb_lower, kc_upper, kc_lower) for the current bar.
+        None if insufficient history.
+        """
+        min_bars = self.BB_PERIOD + 1
+        if len(self._ohlc_bars) < min_bars:
+            return None
+        bars    = self._ohlc_bars[-self.BB_PERIOD:]
+        closes  = np.array([b[0] for b in bars], dtype=float)
+
+        # Bollinger Bands
+        bb_mid   = float(np.mean(closes))
+        bb_std   = float(np.std(closes, ddof=1))
+        bb_upper = bb_mid + self.BB_STD * bb_std
+        bb_lower = bb_mid - self.BB_STD * bb_std
+
+        # Keltner Channel (use same mid as BB for consistency)
+        atr      = self._compute_atr(self.ATR_PERIOD)
+        kc_upper = bb_mid + self.KC_ATR_MULT * atr
+        kc_lower = bb_mid - self.KC_ATR_MULT * atr
+
+        return bb_upper, bb_lower, kc_upper, kc_lower
+
+    def _update_squeeze(self) -> bool:
+        """
+        Update squeeze counter and return True if currently squeezed.
+        Squeeze = BB fully inside KC (upper & lower).
+        """
+        result = self._compute_bb_kc()
+        if result is None:
+            return False
+        bb_upper, bb_lower, kc_upper, kc_lower = result
+        if bb_upper < kc_upper and bb_lower > kc_lower:
+            self._squeeze_count += 1
+        else:
+            self._squeeze_count = 0
+            self._sweep_detected = False   # reset sweep if squeeze breaks
+        return self._squeeze_count >= self.SQUEEZE_BARS
+
+    def _check_sweep(self) -> None:
+        """
+        Detect a false breakdown (liquidity sweep):
+        Price closes below the 20-period low, then recovers above it
+        within SWEEP_RECOVER candles.
+
+        This pattern signals trapped shorts who provide the fuel for the breakout.
+        """
+        need = self.SWEEP_LOOKBK + self.SWEEP_RECOVER + 1
+        if len(self._ohlc_bars) < need:
+            return
+
+        # Identify the 20-period low (excluding the most recent bars)
+        reference_bars = self._ohlc_bars[-(self.SWEEP_LOOKBK + self.SWEEP_RECOVER):
+                                          -self.SWEEP_RECOVER]
+        period_low = min(b[2] for b in reference_bars)   # low prices
+
+        # Look for a sweep in the last SWEEP_RECOVER bars
+        recent = self._ohlc_bars[-self.SWEEP_RECOVER:]
+        for bar in recent:
+            c, h, l = bar
+            if l < period_low and c > period_low:
+                # Low went below the key level but closed back above → sweep!
+                self._sweep_detected = True
+                self._sweep_low      = l
+                return
+
+    def _breakout_level(self) -> float:
+        """Highest High of the last BREAKOUT_BARS candles (the resistance cap)."""
+        recent = self._ohlc_bars[-self.BREAKOUT_BARS:]
+        return float(max(b[1] for b in recent)) if recent else 0.0
+
+    # ── Evaluate ──────────────────────────────────────────────────────────────
+
+    async def evaluate(
+        self, chain: "OptionChainSnapshot"
+    ) -> Optional[StrategySignal]:
+        """
+        Entry logic:
+          SQUEEZE (5+ bars) AND SWEEP occurred AND current bar breaks above
+          the 10-bar highest high → buy ATM call.
+        """
+        self._bar_count += 1
+
+        # Need enough history for all indicators
+        min_needed = self.BB_PERIOD + self.SWEEP_LOOKBK + self.SWEEP_RECOVER + 5
+        if len(self._ohlc_bars) < min_needed:
+            return None
+
+        if not self.is_trading_window():
+            return None
+        if not self._vix_ok(chain):
+            return None
+        if self.db.has_active_trade(self.name):
+            return None
+
+        # One trade per day — prevents overtrading on 1-min squeezes
+        today = chain.timestamp.strftime("%Y-%m-%d")
+        if self._last_signal_day == today:
+            return None
+
+        can_enter, _ = self.risk_manager.can_enter_position()
+        if not can_enter:
+            return None
+
+        # ── Phase 1: Is the squeeze active? ──────────────────────────────
+        is_compressed = self._update_squeeze()
+        if not is_compressed:
+            return None
+
+        # ── Phase 2: Has a sweep occurred? ───────────────────────────────
+        self._check_sweep()
+        if not self._sweep_detected:
+            return None
+
+        # ── Phase 3: Has price broken above the breakout level? ──────────
+        breakout_level = self._breakout_level()
+        current_high   = self._ohlc_bars[-1][1]
+
+        if current_high <= breakout_level:
+            return None   # price hasn't broken out yet — wait
+
+        # ── All conditions met — generate entry signal ────────────────────
+        si  = self._si(chain)
+        atm = chain.atm_strike
+
+        # Fix 3: robust closest-strike lookup — prevents KeyError on any chain
+        atm = self._closest_strike(chain.calls, atm)
+        if atm is None:
+            return None
+        quote = chain.calls.get(atm)
+
+        if not quote or not quote.ltp or quote.ltp < self.config.min_premium:
+            return None
+
+        entry_price = quote.ltp
+
+        # ── Phase 4: Exit levels ──────────────────────────────────────────
+        # Initial SL anchored below the sweep low (converted to option premium %)
+        # We approximate: if underlying dropped X% to sweep low, option delta ~0.5
+        # So option SL ≈ entry × (1 - 0.30) — 30% of premium at risk initially
+        sl_pct  = 0.30
+        sl      = entry_price * (1.0 - sl_pct)
+        # Phase 3 target: first +40% triggers breakeven trail (handled by _dynamic_trailing_sl)
+        target  = entry_price * 1.90   # 1:3 RR ceiling before trailing takes over
+
+        # Mark signal day to prevent re-entry today
+        self._last_signal_day = today
+        # Reset squeeze so we don't re-trigger immediately
+        self._squeeze_count  = 0
+        self._sweep_detected = False
+
+        logger.info(
+            "CompressionBreakout signal: %s  entry=₹%.2f  breakout>₹%.2f  "
+            "sweep_low=₹%.2f  squeeze=%d bars",
+            self._sym(chain, atm, "CE"), entry_price,
+            breakout_level, self._sweep_low, self._squeeze_count,
+        )
+
+        return StrategySignal(
+            signal_type=SignalType.LONG,
+            strategy_name=self.name,
+            timestamp=datetime.now(),
+            confidence=min(1.0, self._squeeze_count / 10.0),
+            entry_price=entry_price,
+            stop_loss=sl,
+            target=target,
+            symbol=self._sym(chain, atm, "CE"),
+            option_type=OptionType.CALL,
+            strike=float(atm),
+            expiry=chain.expiry,
+            metadata={
+                "breakout_level": breakout_level,
+                "sweep_low":      self._sweep_low,
+                "squeeze_bars":   self._squeeze_count,
+                "bb_kc":          str(self._compute_bb_kc()),
+            },
+        )
+
+    # ── Execute ───────────────────────────────────────────────────────────────
+
+    async def execute_signal(self, signal: StrategySignal) -> bool:
+        """Buy ATM call with dynamic lot sizing from the risk engine."""
+        if not self.db.acquire_trade_lock(
+            self.name, signal.symbol, f"strategy_{self.name}"
+        ):
+            return False
+
+        # Phase 4: dynamic lot sizing — 2% of total capital, no sleeve cap
+        qty = self._long_option_lots(signal.entry_price, strategy_type="skewhunter")
+        try:
+            response = await self.broker.place_order(
+                symbol=signal.symbol,
+                exchange=Exchange.NFO,
+                transaction_type=TransactionType.BUY,
+                order_type=OrderType.LIMIT,
+                quantity=qty,
+                price=signal.entry_price,
+                product_type=ProductType.INTRADAY,
+            )
+            if not response.success:
+                logger.error("CompressionBreakout order failed: %s", response.message)
+                self.db.release_trade_lock(self.name, signal.symbol)
+                return False
+
+            from db_lock import TradeRecord, TradeStatus
+            trade = TradeRecord(
+                trade_id=str(uuid.uuid4()),
+                strategy_name=self.name,
+                symbol=signal.symbol,
+                option_type=signal.option_type.value,
+                strike=signal.strike,
+                expiry=signal.expiry,
+                entry_price=signal.entry_price,
+                quantity=qty,
+                direction="BUY",
+                product_type="INTRADAY",
+                status=TradeStatus.ACTIVE.value,
+                stop_loss=signal.stop_loss,
+                target=signal.target,
+                entry_time=datetime.now().isoformat(),
+            )
+            self.db.insert_trade(trade)
+            self.risk_manager.update_position(
+                trade_id=trade.trade_id,
+                symbol=signal.symbol,
+                quantity=qty,
+                average_price=signal.entry_price,
+                current_price=signal.entry_price,
+                direction="BUY",
+                stop_loss=signal.stop_loss,
+                target=signal.target,
+            )
+            logger.info(
+                "CompressionBreakout entry: %s @ ₹%.2f  qty=%d  "
+                "SL=₹%.2f  TGT=₹%.2f",
+                signal.symbol, signal.entry_price, qty,
+                signal.stop_loss, signal.target,
+            )
+            return True
+
+        except Exception as e:
+            logger.error("CompressionBreakout execution error: %s", e)
+            self.db.release_trade_lock(self.name, signal.symbol)
+            return False

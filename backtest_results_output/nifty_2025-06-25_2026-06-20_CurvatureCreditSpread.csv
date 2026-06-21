@@ -1,2 +1,0 @@
-strategy_name,symbol,option_type,strike,direction,entry_time,exit_time,entry_price,exit_price,quantity,pnl,exit_reason
-CurvatureCreditSpread,NFO:NIFTY03JUL2525300PE,PE,25300.0,BUY,2026-06-20T23:30:39.867288,2026-06-20T23:30:39.870581,72.06,10.659,25,-1535.025,INTRABAR_TARGET

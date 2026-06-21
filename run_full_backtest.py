@@ -38,7 +38,8 @@ OUTPUT_DIR = "backtest_results_output"
 INSTRUMENTS = ["nifty", "banknifty", "sensex"]
 STRATEGIES  = [
     "FixedRR_1to3",
-    "CurvatureCreditSpread",
+    # "CurvatureCreditSpread",  # Phase 5: removed — 1 trade, -100% in 18M
+    "CompressionBreakout",
     "SkewHunter",
     "ExpiryShortStrangle",
     "ZenCreditSpread",

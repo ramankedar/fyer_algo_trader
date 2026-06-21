@@ -53,7 +53,6 @@ from instruments import InstrumentSpec, INSTRUMENTS
 from risk_manager import RiskManager, RiskThresholds
 from strategies import (
     FixedRR13Strategy,
-    CurvatureCreditSpreadStrategy,
     SkewHunterStrategy,
 )
 
@@ -568,8 +567,6 @@ def generate_report(
 STRATEGY_NAMES = {
     "FixedRR_1to3":           "FixedRR_1to3",
     "fixedrr":                "FixedRR_1to3",
-    "CurvatureCreditSpread":  "CurvatureCreditSpread",
-    "curvature":              "CurvatureCreditSpread",
     "SkewHunter":             "SkewHunter",
     "skewhunter":             "SkewHunter",
     "ExpiryShortStrangle":    "ExpiryShortStrangle",
@@ -579,6 +576,9 @@ STRATEGY_NAMES = {
     "zen":                    "ZenCreditSpread",
     "LyapunovCreditSpread":   "LyapunovCreditSpread",
     "lyapunov":               "LyapunovCreditSpread",
+    "CompressionBreakout":    "CompressionBreakout",
+    "compression":            "CompressionBreakout",
+    "squeeze":                "CompressionBreakout",
 }
 
 
@@ -673,13 +673,9 @@ async def run_backtest(
             max_position_size=spec.lot_size * 10,
             max_open_positions=4,
             position_size_per_trade=spec.lot_size,
-            # Phase 1/3: Per-strategy capital sleeves — read from env (set by CLI --capital)
-            skewhunter_allocated_capital=float(
-                os.environ.get("SLEEVE_SKEWHUNTER", "100000")),
-            strangle_allocated_capital=float(
-                os.environ.get("SLEEVE_STRANGLE", "300000")),
-            credit_spread_allocated_capital=float(
-                os.environ.get("SLEEVE_CREDIT_SPREAD", "100000")),
+            # Dynamic risk engine — single pool, no hard sleeves
+            max_capital_per_trade_pct=0.30,
+            margin_reserve_minimum=50_000.0,
             risk_per_trade_percent=2.0,
         ),
         on_risk_event=lambda e, d: logger.warning("Risk event: %s", e.value),
@@ -700,17 +696,17 @@ async def run_backtest(
     )
     from strategies import (
         ExpiryShortStrangleStrategy, ZenCreditSpreadStrategy,
-        LyapunovCreditSpreadStrategy,
+        LyapunovCreditSpreadStrategy, CompressionBreakoutStrategy,
     )
 
-    strat_fixed    = FixedRR13Strategy(cfg, bs, db, risk, broker)
-    strat_curv     = CurvatureCreditSpreadStrategy(cfg, bs, db, risk, broker)
-    strat_skew     = SkewHunterStrategy(cfg, bs, db, risk, broker)
-    strat_strangle = ExpiryShortStrangleStrategy(cfg, bs, db, risk, broker)
-    strat_zen      = ZenCreditSpreadStrategy(cfg, bs, db, risk, broker)
-    strat_lyap     = LyapunovCreditSpreadStrategy(cfg, bs, db, risk, broker)
+    strat_fixed       = FixedRR13Strategy(cfg, bs, db, risk, broker)
+    strat_skew        = SkewHunterStrategy(cfg, bs, db, risk, broker)
+    strat_strangle    = ExpiryShortStrangleStrategy(cfg, bs, db, risk, broker)
+    strat_zen         = ZenCreditSpreadStrategy(cfg, bs, db, risk, broker)
+    strat_lyap        = LyapunovCreditSpreadStrategy(cfg, bs, db, risk, broker)
+    strat_compression = CompressionBreakoutStrategy(cfg, bs, db, risk, broker)
 
-    _all = [strat_fixed, strat_curv, strat_skew, strat_strangle, strat_zen, strat_lyap]
+    _all = [strat_fixed, strat_skew, strat_strangle, strat_zen, strat_lyap, strat_compression]
 
     # ── Strategy filter: run only the requested strategy ─────────────────────
     if strategy_filter:
@@ -732,7 +728,6 @@ async def run_backtest(
     # Monkey-patch time checks: BacktestEngine controls windows via bar_time.
     for s in all_strategies:
         s.is_trading_window = lambda: True          # type: ignore[method-assign]
-    strat_curv.is_entry_window = lambda *a, **kw: True  # accepts ts param
 
     # Time window constants
     T_OPEN           = dt_time(9, 15)
@@ -793,8 +788,15 @@ async def run_backtest(
             broker.update_prices(chain)
             total_bars += 1
 
+            # CompressionBreakout needs real OHLC every bar (ATR + sweep detection)
+            if strat_compression in all_strategies:
+                strat_compression._track_ohlc(
+                    bar["close"],
+                    bar.get("high", bar["close"]),
+                    bar.get("low",  bar["close"]),
+                )
+
             # Track spot price every bar for Curvature intraday momentum signal.
-            strat_curv._track_spot(chain)
 
             # ── Phase 4: Intrabar high/low trailing stop check ───────────
             # Using close price alone masks extreme intrabar volatility.
@@ -845,11 +847,7 @@ async def run_backtest(
             # Phase 4: Intraday kill-switch — checked EVERY BAR using bar['low']
             # for worst-case intrabar marking (close prices hide intrabar extremes).
             # Combined capital = sum of all three strategy sleeves.
-            combined_capital = (
-                getattr(risk.thresholds, "skewhunter_allocated_capital",   100_000)
-                + getattr(risk.thresholds, "strangle_allocated_capital",   300_000)
-                + getattr(risk.thresholds, "credit_spread_allocated_capital", 100_000)
-            )
+            combined_capital = risk.capital   # single dynamic pool
             risk.check_intraday_kill_switch(
                 bar_high=bar.get("high", bar["close"]),
                 bar_low =bar.get("low",  bar["close"]),
@@ -882,7 +880,7 @@ async def run_backtest(
 
             # FixedRR, SkewHunter, Zen, Lyapunov — main strategy window
             if T_STRAT_START <= bar_time <= T_STRAT_END:
-                for strategy in [strat_fixed, strat_skew, strat_zen, strat_lyap]:
+                for strategy in [strat_fixed, strat_skew, strat_zen, strat_lyap, strat_compression]:
                     if strategy not in all_strategies:
                         continue
                     try:
@@ -903,14 +901,7 @@ async def run_backtest(
                         logger.debug("Strangle eval: %s", e)
 
             # Curvature fires in the overnight entry window (15:00-15:25)
-            if T_CURV_START <= bar_time <= T_CURV_END:
-                if strat_curv in all_strategies:
-                    try:
-                        sig = await strat_curv.evaluate(chain)
-                        if sig:
-                            await strat_curv.execute_signal(sig)
-                    except Exception as e:
-                        logger.debug("Curvature eval: %s", e)
+            # CurvatureCreditSpread removed (Phase 5: dead weight)
 
             # ── Position management (every bar) ──────────────────────────
 
@@ -977,7 +968,7 @@ def main() -> None:
         metavar="NAME",
         help=(
             "Run a single strategy only. "
-            "Valid names: SkewHunter, FixedRR_1to3, CurvatureCreditSpread, "
+            "Valid names: SkewHunter, FixedRR_1to3, "
             "ExpiryShortStrangle, ZenCreditSpread, LyapunovCreditSpread  "
             "(aliases: skewhunter, fixedrr, curvature, strangle, zen, lyapunov)"
         ),

@@ -104,16 +104,25 @@ class RiskConfig:
     emergency_square_off_time: str   = "15:15:00"
     position_size_per_trade:   int   = 50
 
-    # ── Phase 1: Per-strategy capital sleeves ─────────────────────────────────
-    # The total pool (₹2L–₹5L) is partitioned so strategies cannot compete
-    # for the same margin and a single blowup cannot destroy the whole account.
-    # --capital CLI flag scales all three proportionally at runtime.
-    skewhunter_allocated_capital:  float = 100_000.0   # directional long-option sleeve
-    strangle_allocated_capital:    float = 300_000.0   # short-premium / condor sleeve
-    credit_spread_allocated_capital: float = 100_000.0 # debit/credit spread sleeve
+    # ── Dynamic Margin-Aware Risk Engine (replaces rigid sleeves) ────────────
+    #
+    # Single capital pool — no hard sleeves. Any strategy can use available
+    # capital, subject to three guardrails:
+    #
+    #   max_capital_per_trade_pct  — no single trade consumes > 30% of total
+    #                                (prevents one position crowding out others)
+    #   margin_reserve_minimum     — always keep ₹50K free for SPAN margin
+    #                                (prevents option-seller margin starvation)
+    #   risk_per_trade_percent     — risk exactly 2% of TOTAL capital per trade
+    #                                (Kelly-aligned; larger than sleeve-based 2%)
+    max_capital_per_trade_pct: float = 0.30    # max 30% of capital in one trade
+    margin_reserve_minimum:    float = 50_000.0 # always keep ₹50K for margin buffer
+    risk_per_trade_percent:    float = 2.0      # 2% of total capital at risk
 
-    # ── Phase 1: Per-trade risk ceiling (% of the strategy's sleeve) ─────────
-    risk_per_trade_percent: float = 2.0   # max 2% of sleeve per single trade
+    # Legacy aliases (kept so RiskThresholds dataclass stays backward-compatible)
+    skewhunter_allocated_capital:    float = 200_000.0   # points to full pool now
+    strangle_allocated_capital:      float = 200_000.0
+    credit_spread_allocated_capital: float = 200_000.0
 
 
 @dataclass
@@ -141,7 +150,7 @@ class StrategyConfig:
     # Phase 2: Expiry-day strangle minimum premium (as % of spot)
     # 0.0003 × 25000 = ₹7.50 — allows far-OTM strikes on expiry days where
     # premium is already crushed before 10:30 AM.
-    expiry_min_premium_spot_pct: float = 0.0003
+    expiry_min_premium_spot_pct: float = 0.0001   # Phase 4: ₹2.50 on Nifty — allows 0DTE wings
 
     # Fixed RR 1:3
     fixed_rr_stop_loss_pct: float = 30.0
@@ -152,18 +161,16 @@ class StrategyConfig:
     fixed_rr_alpha2_short_threshold: float = 0.3
 
     # Curvature Credit Spread
-    curvature_threshold: float = 3e-6
-    curvature_entry_start: str = "15:00:00"
-    curvature_entry_end: str = "15:25:00"
-    viscosity_threshold: float = 0.3
+    # Phase 5: CurvatureCreditSpread removed — dead weight (1 trade, -100% in 18M)
+    # curvature_threshold / viscosity_threshold deleted
 
     # SkewHunter
     skewhunter_stop_loss_pct: float = 40.0
     # Phase 2: raw volume-ratio thresholds (NOT z-scored — OI/Vol not normally distributed)
     # Relaxed: 1.25 = calls 25% > puts (was 2.0×); 0.80 = puts 25% > calls (was 0.5×).
     # Prevents trade starvation — real NSE data rarely shows 2× imbalance intraday.
-    skewhunter_volume_ratio_long:  float = 1.25
-    skewhunter_volume_ratio_short: float = 0.80
+    skewhunter_volume_ratio_long:  float = 1.05  # lowered: 1.25 was too strict with bhavcopy volumes
+    skewhunter_volume_ratio_short: float = 0.95  # symmetrical: puts > calls even slightly
     # Legacy (kept for config compatibility)
     skewhunter_alpha1_long:  float = 0.75
     skewhunter_alpha2_long:  float = 0.8

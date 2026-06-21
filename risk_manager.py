@@ -34,11 +34,14 @@ class RiskThresholds:
     max_open_positions:        int   = 4
     position_size_per_trade:   int   = 50
 
-    # Phase 1/3: Per-strategy capital sleeves (mirrors config.RiskConfig)
-    skewhunter_allocated_capital:    float = 100_000.0
-    strangle_allocated_capital:      float = 300_000.0
-    credit_spread_allocated_capital: float = 100_000.0
-    risk_per_trade_percent:          float = 2.0
+    # Dynamic risk engine (mirrors config.RiskConfig — no hard sleeves)
+    max_capital_per_trade_pct: float = 0.30
+    margin_reserve_minimum:    float = 50_000.0
+    risk_per_trade_percent:    float = 2.0
+    # Legacy aliases kept for backward-compat with sleeve_lots calls
+    skewhunter_allocated_capital:    float = 200_000.0
+    strangle_allocated_capital:      float = 200_000.0
+    credit_spread_allocated_capital: float = 200_000.0
 
 
 @dataclass
@@ -273,56 +276,58 @@ class RiskManager:
     
     def sleeve_lots(
         self,
-        strategy_type: str,       # "skewhunter" | "strangle" | "credit_spread"
+        strategy_type: str,
         entry_price:   float,
         lot_size:      int,
         is_hedged:     bool  = False,
         sl_pct:        float = 0.30,
     ) -> int:
         """
-        Phase 3: Sleeve-aware position sizing.
-
-        Each strategy draws from its own capital sleeve (config.RiskConfig).
-        This prevents margin competition between strategies and bounds risk
-        to the sleeve, not the total portfolio.
-
-        Long options / debit spreads (SkewHunter, FixedRR):
-          max_risk = risk_per_trade_percent % of sleeve
-          lots = floor(max_risk / (entry_price × lot_size × sl_pct))
-
-        Short options / condors (Strangle, Lyapunov, Zen credit):
-          Hedged lot (iron condor): SPAN ≈ ₹40,000 / lot
-          Naked lot (strangle):     SPAN ≈ ₹1,20,000 / lot
-          lots = floor(sleeve_capital / margin_per_lot)
+        Phase 2: Dynamic lot sizing — no hardcoded 1-lot ceiling.
+        Formula: lots = floor(risk_amount / sl_per_lot)
+          risk_amount = sleeve_capital * risk_per_trade_pct (default 2%)
+          sl_per_lot  = entry_price * sl_pct * lot_size
+        If math allows 3-5 lots safely within the constraints, deploy them.
         """
-        risk_cfg = self.thresholds   # RiskThresholds carries config sleeve values
+        import math
+        risk_cfg = self.thresholds
+        total    = self.capital   # single dynamic pool — no hard sleeves
 
-        # Resolve sleeve capital
-        sleeve = {
-            "skewhunter":    getattr(risk_cfg, "skewhunter_allocated_capital",   100_000.0),
-            "strangle":      getattr(risk_cfg, "strangle_allocated_capital",      300_000.0),
-            "credit_spread": getattr(risk_cfg, "credit_spread_allocated_capital", 100_000.0),
-        }.get(strategy_type, self.capital)
-
-        risk_pct = getattr(risk_cfg, "risk_per_trade_percent", 2.0)
+        risk_pct        = getattr(risk_cfg, "risk_per_trade_percent",    2.0)
+        max_trade_pct   = getattr(risk_cfg, "max_capital_per_trade_pct", 0.30)
+        margin_reserve  = getattr(risk_cfg, "margin_reserve_minimum",    50_000.0)
+        available       = max(0.0, total - margin_reserve)  # usable capital
 
         if strategy_type in ("skewhunter", "fixedrr", "credit_spread"):
-            # Long / debit: risk = premium × qty × sl_pct
-            max_risk     = sleeve * (risk_pct / 100)
-            cost_per_lot = max(1.0, entry_price) * lot_size * sl_pct
-            lots         = max(1, int(max_risk / cost_per_lot))
-        else:
-            # Short / condor: risk = margin per lot
-            margin_per_lot = 40_000 if is_hedged else 120_000
-            lots           = max(1, int(sleeve / margin_per_lot))
+            # Fix 2A: Option BUYING only requires the premium in cash — NOT SPAN margin.
+            # Bypass margin_reserve_minimum for buyers. Use full capital.
+            buyer_capital = total   # no reserve needed for buying premium
 
-        # Hard cap: never risk more than total portfolio capital
-        max_by_total = max(1, int(self.capital * 0.10 / max(1, entry_price * lot_size)))
-        lots = min(lots, max_by_total, 5)   # absolute ceiling: 5 lots
+            # ── Step A: risk-based lot count ───────────────────────────────
+            risk_budget = total * (risk_pct / 100)           # 2% of total capital
+            sl_per_lot  = max(1.0, entry_price) * sl_pct * lot_size
+            target_lots = math.floor(risk_budget / sl_per_lot)
+
+            # Fix 2B: If math gives < 1 lot, force exactly 1 lot.
+            # Never return 0 lots for a valid signal.
+            if target_lots < 1:
+                target_lots = 1
+
+            # ── Step B: 30% capital cap (prevents concentration) ──────────
+            cost_per_lot        = max(1.0, entry_price) * lot_size
+            max_capital_to_use  = buyer_capital * max_trade_pct
+            max_lots_by_capital = max(1, math.floor(max_capital_to_use / cost_per_lot))
+
+            lots = min(target_lots, max_lots_by_capital)
+
+        else:
+            # Short options / Iron Condor — margin-based sizing uses reserve
+            margin_per_lot = 40_000 if is_hedged else 120_000
+            lots = max(1, math.floor(available / margin_per_lot))
 
         logger.debug(
-            "sleeve_lots: strategy=%s sleeve=₹%.0f lots=%d entry=₹%.2f",
-            strategy_type, sleeve, lots, entry_price,
+            "sleeve_lots: strategy=%s total=₹%.0f available=₹%.0f lots=%d entry=₹%.2f",
+            strategy_type, total, available, lots, entry_price,
         )
         return lots
 
