@@ -95,13 +95,25 @@ class BrokerConfig:
 
 @dataclass
 class RiskConfig:
-    max_daily_loss_percent: float = 2.0
-    max_position_size: int = 1800  # Nifty lot size
-    max_open_positions: int = 4
-    max_drawdown_percent: float = 5.0
+    # ── Portfolio-level guards ────────────────────────────────────────────────
+    max_daily_loss_percent:    float = 2.0
+    max_position_size:         int   = 1800
+    max_open_positions:        int   = 4
+    max_drawdown_percent:      float = 5.0
     trailing_drawdown_percent: float = 3.0
-    emergency_square_off_time: str = "15:15:00"
-    position_size_per_trade: int = 50  # One lot
+    emergency_square_off_time: str   = "15:15:00"
+    position_size_per_trade:   int   = 50
+
+    # ── Phase 1: Per-strategy capital sleeves ─────────────────────────────────
+    # The total pool (₹2L–₹5L) is partitioned so strategies cannot compete
+    # for the same margin and a single blowup cannot destroy the whole account.
+    # --capital CLI flag scales all three proportionally at runtime.
+    skewhunter_allocated_capital:  float = 100_000.0   # directional long-option sleeve
+    strangle_allocated_capital:    float = 300_000.0   # short-premium / condor sleeve
+    credit_spread_allocated_capital: float = 100_000.0 # debit/credit spread sleeve
+
+    # ── Phase 1: Per-trade risk ceiling (% of the strategy's sleeve) ─────────
+    risk_per_trade_percent: float = 2.0   # max 2% of sleeve per single trade
 
 
 @dataclass
@@ -119,7 +131,18 @@ class StrategyConfig:
     min_premium: float = 20.0
     trading_start_time: str = "10:15:00"
     trading_end_time: str = "14:15:00"
-    
+
+    # Phase 2: Z-score entry gates — relaxed from 0.85/−0.85 to 0.65/−0.65.
+    # 0.65 ≈ top/bottom 26% of observations (was 20%).  Eliminates trade starvation
+    # seen with the tighter threshold in low-VIX 2025 environments.
+    z_score_long_threshold:  float = 0.65
+    z_score_short_threshold: float = -0.65
+
+    # Phase 2: Expiry-day strangle minimum premium (as % of spot)
+    # 0.0003 × 25000 = ₹7.50 — allows far-OTM strikes on expiry days where
+    # premium is already crushed before 10:30 AM.
+    expiry_min_premium_spot_pct: float = 0.0003
+
     # Fixed RR 1:3
     fixed_rr_stop_loss_pct: float = 30.0
     fixed_rr_target_pct: float = 90.0
@@ -127,17 +150,23 @@ class StrategyConfig:
     fixed_rr_alpha2_long_threshold: float = 0.7
     fixed_rr_alpha1_short_threshold: float = 0.25
     fixed_rr_alpha2_short_threshold: float = 0.3
-    
+
     # Curvature Credit Spread
-    curvature_threshold: float = 3e-6   # lowered: 1.5e-5 is above max achievable with synthetic chains
+    curvature_threshold: float = 3e-6
     curvature_entry_start: str = "15:00:00"
     curvature_entry_end: str = "15:25:00"
     viscosity_threshold: float = 0.3
-    
+
     # SkewHunter
     skewhunter_stop_loss_pct: float = 40.0
-    skewhunter_alpha1_long: float = 0.75
-    skewhunter_alpha2_long: float = 0.8
+    # Phase 2: raw volume-ratio thresholds (NOT z-scored — OI/Vol not normally distributed)
+    # Relaxed: 1.25 = calls 25% > puts (was 2.0×); 0.80 = puts 25% > calls (was 0.5×).
+    # Prevents trade starvation — real NSE data rarely shows 2× imbalance intraday.
+    skewhunter_volume_ratio_long:  float = 1.25
+    skewhunter_volume_ratio_short: float = 0.80
+    # Legacy (kept for config compatibility)
+    skewhunter_alpha1_long:  float = 0.75
+    skewhunter_alpha2_long:  float = 0.8
     skewhunter_alpha1_short: float = 0.25
     skewhunter_alpha2_short: float = 0.2
     skewhunter_square_off_time: str = "15:15:00"

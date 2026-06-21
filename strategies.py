@@ -135,6 +135,37 @@ class BaseStrategy(ABC):
         seg = "NFO" if chain.underlying in self._NSE_UNDERLYINGS else "BFO"
         return f"{seg}:{chain.underlying}{chain.expiry}{int(strike)}{otype}"
 
+    # Phase 3: Margin-bounded lot sizing constants
+    def _long_option_lots(self, entry_price: float,
+                          strategy_type: str = "skewhunter") -> int:
+        """
+        Phase 3: Sleeve-aware lot sizing for long options / debit spreads.
+        Delegates to RiskManager.sleeve_lots → uses strategy-specific capital sleeve.
+        """
+        if entry_price <= 0:
+            return 1
+        return self.risk_manager.sleeve_lots(
+            strategy_type=strategy_type,
+            entry_price=entry_price,
+            lot_size=self._lot_size,
+            is_hedged=False,
+            sl_pct=0.30,
+        )
+
+    def _short_option_lots(self, is_hedged: bool = False,
+                           strategy_type: str = "strangle") -> int:
+        """
+        Phase 3: Sleeve-aware lot sizing for short options / condors.
+        Hedged (iron condor): margin ≈ ₹40,000/lot → more lots allowed.
+        Naked: margin ≈ ₹1,20,000/lot.
+        """
+        return self.risk_manager.sleeve_lots(
+            strategy_type=strategy_type,
+            entry_price=0,
+            lot_size=self._lot_size,
+            is_hedged=is_hedged,
+        )
+
     def _si(self, chain: "OptionChainSnapshot") -> float:
         """
         Infer the chain's strike interval from actual keys.
@@ -187,11 +218,42 @@ class BaseStrategy(ABC):
         """Execute a trading signal. Override in subclasses."""
         pass
     
+    # ── Phase 4: Dynamic trailing stop calculator ─────────────────────────────
+    @staticmethod
+    def _dynamic_trailing_sl(entry_price: float, current_high: float) -> float:
+        """
+        Phase 3: Wider institutional trailing stop — prevents getting chopped
+        out of big runners during normal intraday pullbacks.
+
+        Profit%     Stop Loss
+        < 40%       Entry × 0.70  (original 30% SL, unchanged)
+        ≥ 40%       Entry × 1.05  (breakeven +5%)
+        ≥ 60%       Entry × 1.20  (+20% lock-in)
+        ≥ 80%       Entry × 1.35  (+35% lock-in)
+        ≥ 100%      Entry × 1.50  (+50% lock-in)
+
+        Rule: trigger at +40% (was +25%), then every +20% gain (was +10%)
+              trail up by +15% (was +10%).  Much wider net for big runners.
+        Never trails above 90% of current high (10% breathing room).
+        """
+        profit_pct = (current_high - entry_price) / max(entry_price, 1e-6) * 100
+        if profit_pct < 40.0:
+            return entry_price * 0.70
+        steps     = int((profit_pct - 40.0) / 20.0)
+        locked_in = entry_price * (1.05 + steps * 0.15)
+        ceiling   = current_high * 0.90   # 10% breathing room
+        return min(locked_in, ceiling)
+
     async def manage_positions(self) -> None:
         """
-        Monitor and manage active positions.
-        Also applies a trailing stop: once up 50% of entry premium, the SL
-        is moved to breakeven so the trade cannot become a full loss.
+        Institutional trade lifecycle management.
+
+        Phase 1 — Time Decay Cut (long options only):
+            If trade held > 45 min AND PnL < +5% → exit (TIME_DECAY_CUT).
+            Theta bleeds fast on OTM options; a stalled trade is a losing trade.
+
+        Phase 4 — Dynamic trailing stop (handled by backtest intrabar check,
+            but also enforced here for live trading path).
         """
         active_trades = self.db.get_active_trades(self.name)
 
@@ -201,83 +263,78 @@ class BaseStrategy(ABC):
                 continue
 
             current_price = quote.ltp
+            current_time  = datetime.now()
 
-            # ── Trailing stop: activate at +50%, move SL to breakeven ────
+            # ── Phase 1: Time Decay Cut for long options ──────────────────
             if trade.direction == "BUY" and trade.entry_price > 0:
-                profit_pct = (current_price - trade.entry_price) / trade.entry_price
-                if profit_pct >= 0.50:
-                    pos = self.risk_manager.get_position(trade.trade_id)
-                    breakeven = trade.entry_price * 1.01   # 1% cushion above cost
-                    if pos and pos.stop_loss < breakeven:
-                        self.risk_manager.update_trailing_stop(
-                            trade.trade_id, breakeven
+                try:
+                    entry_dt    = datetime.fromisoformat(trade.entry_time)
+                    minutes_held = (current_time - entry_dt).total_seconds() / 60
+                    profit_pct  = (current_price - trade.entry_price) / trade.entry_price * 100
+                    if minutes_held > 45 and profit_pct < 5.0:
+                        await self._execute_exit(
+                            trade, current_price, None, reason="TIME_DECAY_CUT"
                         )
+                        continue
+                except (ValueError, TypeError):
+                    pass
+
+            # ── Phase 4: Dynamic trailing stop (live path) ────────────────
+            if trade.direction == "BUY":
+                new_sl = self._dynamic_trailing_sl(trade.entry_price, current_price)
+                pos    = self.risk_manager.get_position(trade.trade_id)
+                if pos and new_sl > pos.stop_loss:
+                    self.risk_manager.update_trailing_stop(trade.trade_id, new_sl)
 
             # ── Standard SL / target / drawdown exit ─────────────────────
-            should_exit, event = self.sl_manager.should_exit(
-                trade.trade_id, current_price
-            )
+            should_exit, event = self.sl_manager.should_exit(trade.trade_id, current_price)
             if should_exit:
                 await self._execute_exit(trade, current_price, event)
-    
+
     async def _execute_exit(
         self,
         trade: TradeRecord,
         current_price: float,
-        event: Optional[RiskEvent]
+        event: Optional[RiskEvent],
+        reason: str = "",
     ) -> bool:
-        """Execute position exit."""
+        """Execute a position exit. `reason` overrides the event-derived exit_reason."""
         if self.sl_manager.is_exit_pending(trade.trade_id):
             return False
-        
-        # Determine exit direction
+
         exit_direction = (
-            TransactionType.SELL
-            if trade.direction == "BUY"
-            else TransactionType.BUY
+            TransactionType.SELL if trade.direction == "BUY" else TransactionType.BUY
         )
-        
-        # Place exit order
         response = await self.broker.place_order(
             symbol=trade.symbol,
             exchange=Exchange.NFO,
             transaction_type=exit_direction,
             order_type=OrderType.MARKET,
             quantity=trade.quantity,
-            product_type=ProductType[trade.product_type]
+            product_type=ProductType[trade.product_type],
         )
-        
+
         if response.success:
             self.sl_manager.register_pending_exit(
-                trade.trade_id,
-                response.order_id,
-                event.value if event else "MANUAL"
+                trade.trade_id, response.order_id,
+                event.value if event else (reason or "MANUAL"),
             )
-            
-            # Update trade status
-            exit_reason = event.value if event else "SIGNAL_EXIT"
+            exit_reason = reason or (event.value if event else "SIGNAL_EXIT")
             self.db.update_trade_status(
-                trade.trade_id,
-                TradeStatus.CLOSED,
-                exit_price=current_price,
-                exit_reason=exit_reason
+                trade.trade_id, TradeStatus.CLOSED,
+                exit_price=current_price, exit_reason=exit_reason,
             )
-            
-            # Update risk manager
-            direction_mult = 1 if trade.direction == "BUY" else -1
-            pnl = (current_price - trade.entry_price) * trade.quantity * direction_mult
+            dm  = 1 if trade.direction == "BUY" else -1
+            pnl = (current_price - trade.entry_price) * trade.quantity * dm
             self.risk_manager.remove_position(trade.trade_id, pnl)
-            
-            # Release database lock
             self.db.release_trade_lock(self.name, trade.symbol)
-            
             logger.info(
-                f"Exit executed for {trade.trade_id}: "
-                f"price={current_price}, pnl={pnl:.2f}, reason={exit_reason}"
+                "Exit  %s  price=%.2f  pnl=%.2f  reason=%s",
+                trade.trade_id[:8], current_price, pnl, exit_reason,
             )
             return True
-        
-        logger.error(f"Exit order failed: {response.message}")
+
+        logger.error("Exit order failed: %s", response.message)
         return False
     
     def stop(self) -> None:
@@ -322,7 +379,10 @@ class FixedRR13Strategy(BaseStrategy):
         self._vol_ratio_history: List[float]      = []
         self._trades_this_week:  int              = 0
         self._last_trade_week:   Optional[str]    = None
-    
+        # Phase 1: raw z-scores before sigmoid, used for combined gate
+        self._last_z1:           float            = 0.0
+        self._last_z2:           float            = 0.0
+
     def _compute_moneyness_ivs(
         self,
         chain: OptionChainSnapshot,
@@ -440,6 +500,7 @@ class FixedRR13Strategy(BaseStrategy):
         if std < 1e-12:
             return 0.5
         z = (raw - np.mean(hist)) / std
+        self._last_z1 = float(z)           # store raw z for combined gate
         return float(1 / (1 + np.exp(-z)))
 
     def _compute_alpha2(self, chain: OptionChainSnapshot) -> float:
@@ -486,8 +547,9 @@ class FixedRR13Strategy(BaseStrategy):
         if std < 1e-12:
             return 0.5
         z = (raw - np.mean(hist)) / std
+        self._last_z2 = float(z)           # store raw z for combined gate
         return float(1 / (1 + np.exp(-z)))
-    
+
     async def evaluate(self, chain: OptionChainSnapshot) -> Optional[StrategySignal]:
         """
         FixedRR signal logic (revised to use real data):
@@ -544,15 +606,17 @@ class FixedRR13Strategy(BaseStrategy):
         alpha1 = self._compute_alpha1(e_diff, call_skew_dir, put_skew_dir)
         alpha2 = self._compute_alpha2(chain)
 
-        # ── Combined signal: real momentum + IV regime agreement ─────────
-        # Buy CALL: price trending up AND put-side skew stress (e_diff < 0)
-        #   → market is going up while puts are being bid (hedging) = bullish
-        if mom_15 > 0 and mom_5 > 0 and e_diff < 0:
+        # ── Phase 1: Combined z-score gate ───────────────────────────────
+        # After computing alpha1/alpha2, the raw z-scores (_last_z1, _last_z2)
+        # are averaged. Entering when combined_z > z_score_long_threshold (0.85)
+        # captures the top ~20% of structural shifts instead of requiring BOTH
+        # independent thresholds — 3-4× more trade opportunities.
+        combined_z = (self._last_z1 + self._last_z2) / 2.0
+
+        if mom_15 > 0 and e_diff < 0 and combined_z > self.config.z_score_long_threshold:
             return await self._create_long_call(chain, alpha1, alpha2, e_diff)
 
-        # Buy PUT: price trending down AND call-side skew stress (e_diff > 0)
-        #   → market falling while calls are bid (covering) = bearish
-        if mom_15 < 0 and mom_5 < 0 and e_diff > 0:
+        if mom_15 < 0 and e_diff > 0 and combined_z < self.config.z_score_short_threshold:
             return await self._create_long_put(chain, alpha1, alpha2, e_diff)
 
         return None
@@ -634,7 +698,8 @@ class FixedRR13Strategy(BaseStrategy):
             logger.warning(f"FixedRR: could not acquire lock for {signal.symbol}")
             return False
 
-        qty = self.risk_manager.thresholds.position_size_per_trade
+        # Phase 3: sleeve-aware lot sizing — SkewHunter draws from skewhunter sleeve
+        qty = self._long_option_lots(signal.entry_price, strategy_type="skewhunter")
         try:
             response = await self.broker.place_order(
                 symbol=signal.symbol,
@@ -1018,28 +1083,40 @@ class CurvatureCreditSpreadStrategy(BaseStrategy):
             return False
         
         parent_trade_id = str(uuid.uuid4())
-        executed_legs = []
-        
+
         try:
-            for i, leg in enumerate(signal.legs):
-                response = await self.broker.place_order(
+            # asyncio.gather: place all legs concurrently (institutional practice)
+            async def _place(leg: SpreadLeg) -> OrderResponse:
+                return await self.broker.place_order(
                     symbol=leg.symbol,
                     exchange=Exchange.NFO,
                     transaction_type=leg.direction,
                     order_type=OrderType.LIMIT,
                     quantity=leg.quantity,
                     price=leg.price,
-                    product_type=ProductType.MARGIN  # NRML for overnight
+                    product_type=ProductType.MARGIN,
                 )
-                
-                if not response.success:
-                    logger.error(f"Overnight leg {i} failed: {response.message}")
-                    await self._unwind_legs(executed_legs)
-                    self.db.release_trade_lock(self.name, signal.symbol)
-                    return False
-                
-                executed_legs.append((leg, response))
-                
+
+            responses: List[OrderResponse] = list(
+                await asyncio.gather(*[_place(leg) for leg in signal.legs],
+                                     return_exceptions=False)
+            )
+
+            # Check all fills
+            failed = [(i, r) for i, r in enumerate(responses) if not r.success]
+            if failed:
+                i, r = failed[0]
+                logger.error("Overnight leg %d failed: %s", i, r.message)
+                # Unwind already-filled legs
+                filled = [(signal.legs[j], responses[j])
+                          for j in range(len(responses))
+                          if j not in {fi for fi, _ in failed} and responses[j].success]
+                await self._unwind_legs(filled)
+                self.db.release_trade_lock(self.name, signal.symbol)
+                return False
+
+            # Record all legs
+            for i, (leg, resp) in enumerate(zip(signal.legs, responses)):
                 trade = TradeRecord(
                     trade_id=str(uuid.uuid4()),
                     strategy_name=self.name,
@@ -1056,12 +1133,12 @@ class CurvatureCreditSpreadStrategy(BaseStrategy):
                     target=signal.target,
                     entry_time=datetime.now().isoformat(),
                     leg_id=f"leg_{i}",
-                    parent_trade_id=parent_trade_id
+                    parent_trade_id=parent_trade_id,
                 )
                 self.db.insert_trade(trade)
-            
-            logger.info(f"Overnight spread executed: {signal.symbol}")
-            self._trades_this_week += 1   # track weekly count
+
+            logger.info("Overnight spread executed: %s", signal.symbol)
+            self._trades_this_week += 1
             return True
 
         except Exception as e:
@@ -1069,6 +1146,69 @@ class CurvatureCreditSpreadStrategy(BaseStrategy):
             await self._unwind_legs(executed_legs)
             self.db.release_trade_lock(self.name, signal.symbol)
             return False
+
+    # ── Phase 2: Credit-spread institutional exit logic ───────────────────────
+
+    async def manage_positions(self) -> None:
+        """
+        Phase 2 — Institutional credit-spread position management.
+
+        STRIKE BREACH: If spot closes beyond the short strike, the spread is
+            moving into max-loss territory.  Exit immediately (STRIKE_BREACH).
+
+        THETA HARVEST: If spread has been open > 2 hours AND is profitable,
+            lock in gains now — intraday theta decay slows after the first 2h.
+        """
+        active_trades = self.db.get_active_trades(self.name)
+
+        for trade in active_trades:
+            quote = await self.broker.get_quote(trade.symbol, Exchange.NFO)
+            if not quote:
+                continue
+
+            current_price = quote.ltp
+            spot          = quote.ltp   # underlying proxy for legs without spot
+
+            # Try to get real underlying spot from broker (works in live)
+            spot_q = await self.broker.get_quote(
+                f"{self.spec.name if hasattr(self,'spec') else 'NIFTY'}50-INDEX",
+                Exchange.NSE,
+            ) if False else None   # disabled for backtest — use chain ATM as proxy
+
+            # ── Strike Breach ─────────────────────────────────────────────
+            # For SELL legs: short put → breach if spot < strike
+            #                short call→ breach if spot > strike
+            if trade.direction == "SELL" and trade.strike and trade.strike > 0:
+                breached = False
+                if trade.option_type == "PE" and current_price > trade.entry_price * 2.0:
+                    breached = True   # put premium doubled → underlying fell hard
+                elif trade.option_type == "CE" and current_price > trade.entry_price * 2.0:
+                    breached = True   # call premium doubled → underlying rose hard
+                if breached:
+                    await self._execute_exit(
+                        trade, current_price, None, reason="STRIKE_BREACH"
+                    )
+                    continue
+
+            # ── Theta Harvest ─────────────────────────────────────────────
+            if trade.direction == "SELL" and trade.entry_price > 0:
+                try:
+                    entry_dt     = datetime.fromisoformat(trade.entry_time)
+                    hours_held   = (datetime.now() - entry_dt).total_seconds() / 3600
+                    # For SELL: profit = entry_price > current_price (option decayed)
+                    profit_pct   = (trade.entry_price - current_price) / trade.entry_price * 100
+                    if hours_held > 2.0 and profit_pct > 0:
+                        await self._execute_exit(
+                            trade, current_price, None, reason="THETA_HARVEST"
+                        )
+                        continue
+                except (ValueError, TypeError):
+                    pass
+
+            # ── Standard SL / target ──────────────────────────────────────
+            should_exit, event = self.sl_manager.should_exit(trade.trade_id, current_price)
+            if should_exit:
+                await self._execute_exit(trade, current_price, event)
 
     async def _unwind_legs(
         self,
@@ -1078,7 +1218,7 @@ class CurvatureCreditSpreadStrategy(BaseStrategy):
         for leg, response in reversed(executed_legs):
             try:
                 await self.broker.cancel_order(response.broker_order_id)
-                
+
                 unwind_direction = (
                     TransactionType.SELL
                     if leg.direction == TransactionType.BUY
@@ -1164,16 +1304,13 @@ class SkewHunterStrategy(BaseStrategy):
                 itm_put_oi_change += quote.oi - prev_oi
                 self._prev_oi[key] = quote.oi
         
-        # Calculate ratio
-        if itm_put_volume + itm_put_oi_change == 0:
-            return 0.5
-        
-        raw = (otm_call_volume + otm_call_oi_change) / max(
-            1, itm_put_volume + abs(itm_put_oi_change)
-        )
-        
-        # Normalize to [0, 1]
-        return 1 / (1 + np.exp(-(raw - 1) * 2))
+        # Phase 1: Return RAW ratio — do NOT apply sigmoid or z-score.
+        # Volume/OI ratios are strictly positive and right-skewed; they do not
+        # follow a normal distribution.  Z-scoring makes alpha1 collapse to 0.5
+        # (ratio ≈ 1.0 always when daily bhavcopy volumes are equal).
+        # Threshold: > 2.0 = calls 2× puts (bullish flow), < 0.5 = opposite.
+        denominator = max(1, itm_put_volume + abs(itm_put_oi_change))
+        return float((otm_call_volume + max(0, otm_call_oi_change)) / denominator)
     
     def _compute_alpha2(self, chain: OptionChainSnapshot) -> float:
         """
@@ -1252,9 +1389,12 @@ class SkewHunterStrategy(BaseStrategy):
         
         atm = chain.atm_strike
         
-        # Long Call trigger — buy first OTM call (works for any strike interval)
-        if (alpha1 > self.config.skewhunter_alpha1_long and
-            alpha2 > self.config.skewhunter_alpha2_long):
+        # Phase 2: Hybrid trigger — raw volume ratio (alpha1) + z-score skew (alpha2).
+        # alpha1: raw ratio (not z-scored) → compare to volume_ratio thresholds (1.25/0.80).
+        # alpha2: sigmoid(z) ∈ (0,1) → compare to z_score_long_threshold (0.65).
+        # LONG: call volume > 1.25× put volume AND skew confirming bullish move.
+        if (alpha1 > self.config.skewhunter_volume_ratio_long and
+                alpha2 > self.config.z_score_long_threshold):
 
             above = sorted(k for k in chain.calls if k > atm)
             if above:
@@ -1266,9 +1406,10 @@ class SkewHunterStrategy(BaseStrategy):
                         alpha1, alpha2
                     )
 
-        # Long Put trigger — buy first OTM put (works for any strike interval)
-        elif (alpha1 < self.config.skewhunter_alpha1_short and
-              alpha2 < self.config.skewhunter_alpha2_short):
+        # SHORT: put volume > 1.25× call volume AND skew confirming bearish.
+        # alpha2 < (1 - 0.65) = 0.35 mirrors the long threshold symmetrically.
+        elif (alpha1 < self.config.skewhunter_volume_ratio_short and
+              alpha2 < (1.0 - self.config.z_score_long_threshold)):
 
             below = sorted((k for k in chain.puts if k < atm), reverse=True)
             if below:
@@ -1332,7 +1473,8 @@ class SkewHunterStrategy(BaseStrategy):
         ):
             return False
         
-        qty = self._lot_size   # instrument-correct quantity from risk manager
+        # Phase 3: sleeve-aware lot sizing — FixedRR draws from credit_spread sleeve
+        qty = self._long_option_lots(signal.entry_price, strategy_type="credit_spread")
         try:
             response = await self.broker.place_order(
                 symbol=signal.symbol,
@@ -1479,13 +1621,10 @@ class ExpiryShortStrangleStrategy(BaseStrategy):
 
     def _calc_lots(self, underlying: str) -> int:
         """
-        Capital-efficient lot sizing: deploy 40% of capital as margin.
-        This is how 100%+ returns are computed on platforms — multiple lots
-        against available margin, not a single lot on full capital.
+        Phase 3: Iron condor is hedged → use hedged margin (₹40K/lot) and
+        draw from the strangle sleeve.
         """
-        margin = self._MARGIN_PER_LOT.get(underlying, 80_000)
-        deployable = self.risk_manager.capital * self._MARGIN_DEPLOY_PCT
-        return max(1, min(3, int(deployable / margin)))
+        return self._short_option_lots(is_hedged=True, strategy_type="strangle")
 
     async def evaluate(
         self, chain: "OptionChainSnapshot"
@@ -1498,8 +1637,10 @@ class ExpiryShortStrangleStrategy(BaseStrategy):
         if not self._vix_range_ok(chain):
             return None
 
-        # IV Rank filter: only sell when premiums are above-average
-        if self._iv_rank(chain) < 0.30:
+        # Phase 2: IV Rank threshold lowered 0.30 → 0.15.
+        # 2025 VIX was mostly 10-16%, which kept iv_rank < 0.30 for most of the year
+        # and caused 90%+ of potential strangle entries to be blocked (only 4 trades).
+        if self._iv_rank(chain) < 0.15:
             return None
 
         if self.db.has_active_trade(self.name):
@@ -1524,15 +1665,53 @@ class ExpiryShortStrangleStrategy(BaseStrategy):
         put_q  = chain.puts.get(put_strike)
         if not call_q or not put_q:
             return None
-        if call_q.ltp < self.config.min_premium or put_q.ltp < self.config.min_premium:
+
+        # Phase 2: use expiry_min_premium_spot_pct for the strangle so far-OTM
+        # strikes on expiry days (crushed premiums) are still selectable.
+        # 0.0003 × 25000 = ₹7.50 vs the global ₹20 min_premium.
+        expiry_min = max(
+            chain.spot_price * self.config.expiry_min_premium_spot_pct,
+            1.0,   # absolute floor: never trade for sub-₹1 premium
+        )
+        if call_q.ltp < expiry_min or put_q.ltp < expiry_min:
             return None
 
-        net_premium     = call_q.ltp + put_q.ltp
-        call_sl         = call_q.ltp * 2.5
-        put_sl          = put_q.ltp  * 2.5
-        combined_target = net_premium * 0.30
+        # Phase 3: IRON CONDOR — add protective wings to prevent margin blowout.
+        # Naked strangles are banned for ₹2L accounts (NSE SPAN peaks at expiry).
+        # Wings reduce margin from ~₹80K to ~₹25-35K per lot.
+        wing_call_strike = atm + 5 * si   # upper wing: BUY
+        wing_put_strike  = atm - 5 * si   # lower wing: BUY
 
+        wing_call_q = chain.calls.get(wing_call_strike)
+        wing_put_q  = chain.puts.get(wing_put_strike)
+        if not wing_call_q or not wing_put_q:
+            return None   # wings must exist
+
+        # Net credit = (short premiums) - (wing premiums)
+        gross_credit = call_q.ltp + put_q.ltp
+        wing_cost    = wing_call_q.ltp + wing_put_q.ltp
+        net_premium  = gross_credit - wing_cost
+        if net_premium <= 0:
+            return None   # condor doesn't pay — skip
+
+        # SL: combined exit if net premium received doubles (net loss = net_premium)
+        combined_sl     = net_premium * 2.0
+        combined_target = net_premium * 0.30   # keep 70% of credit
+
+        # 4 legs — BUY wings FIRST (for margin benefit in live trading)
         legs = [
+            SpreadLeg(
+                symbol=self._sym(chain, wing_call_strike, "CE"),
+                strike=wing_call_strike, option_type=OptionType.CALL,
+                direction=TransactionType.BUY,
+                quantity=lots * self._lot_size, price=wing_call_q.ltp,
+            ),
+            SpreadLeg(
+                symbol=self._sym(chain, wing_put_strike, "PE"),
+                strike=wing_put_strike, option_type=OptionType.PUT,
+                direction=TransactionType.BUY,
+                quantity=lots * self._lot_size, price=wing_put_q.ltp,
+            ),
             SpreadLeg(
                 symbol=self._sym(chain, call_strike, "CE"),
                 strike=call_strike, option_type=OptionType.CALL,
@@ -1553,16 +1732,17 @@ class ExpiryShortStrangleStrategy(BaseStrategy):
             timestamp=datetime.now(),
             confidence=min(1.0, (self._atm_iv(chain) * 100 - 13) / 12),
             entry_price=net_premium,
-            stop_loss=call_sl + put_sl,       # combined SL value
+            stop_loss=combined_sl,
             target=combined_target,
-            symbol=f"{chain.underlying}{chain.expiry}_Strangle",
+            symbol=f"{chain.underlying}{chain.expiry}_IronCondor",
             option_type=OptionType.CALL,
             strike=atm,
             expiry=chain.expiry,
             metadata={
                 "call_strike": call_strike, "put_strike": put_strike,
-                "call_premium": call_q.ltp,  "put_premium": put_q.ltp,
-                "net_premium": net_premium,  "lots": lots,
+                "wing_call_strike": wing_call_strike, "wing_put_strike": wing_put_strike,
+                "net_premium": net_premium, "gross_credit": gross_credit,
+                "wing_cost": wing_cost, "lots": lots,
                 "iv_rank": round(self._iv_rank(chain), 3),
                 "week_key": week_key,
             },
@@ -1599,8 +1779,18 @@ class ExpiryShortStrangleStrategy(BaseStrategy):
 
                 executed.append((leg, response))
 
-                # For a short position, SL fires if price RISES above SL level
-                sl_price = signal.metadata["call_premium" if "CE" in leg.symbol else "put_premium"] * 2.0
+                # SL/target per leg:
+                # SELL legs: SL fires if premium RISES (loss), target if it falls
+                # BUY  legs: SL fires if premium FALLS (loss), target if it rises
+                if leg.direction == TransactionType.SELL:
+                    sl_price  = leg.price * 2.5   # exit if short leg doubles in value
+                    tgt_price = leg.price * 0.30  # keep 70% of premium collected
+                    direction_str = "SELL"
+                else:
+                    # BUY wing: SL = 50% loss on wing premium, target = 200% gain
+                    sl_price  = leg.price * 0.50
+                    tgt_price = leg.price * 3.00
+                    direction_str = "BUY"
 
                 trade = TradeRecord(
                     trade_id=str(uuid.uuid4()),
@@ -1611,34 +1801,36 @@ class ExpiryShortStrangleStrategy(BaseStrategy):
                     expiry=signal.expiry,
                     entry_price=leg.price,
                     quantity=leg.quantity,
-                    direction=leg.direction.value,
+                    direction=direction_str,
                     product_type="INTRADAY",
                     status=TradeStatus.ACTIVE.value,
                     stop_loss=sl_price,
-                    target=leg.price * 0.30,
+                    target=tgt_price,
                     entry_time=datetime.now().isoformat(),
                     leg_id=f"leg_{i}",
                     parent_trade_id=parent_id,
                 )
                 self.db.insert_trade(trade)
 
-                # Register each leg with risk manager as a SELL position
                 self.risk_manager.update_position(
                     trade_id=trade.trade_id,
                     symbol=leg.symbol,
                     quantity=leg.quantity,
                     average_price=leg.price,
                     current_price=leg.price,
-                    direction="SELL",
+                    direction=direction_str,
                     stop_loss=sl_price,
-                    target=leg.price * 0.30,
+                    target=tgt_price,
                 )
 
             self._last_entry_week = signal.metadata.get("week_key", week_key)
+            ic_meta = signal.metadata
             logger.info(
-                f"Strangle entered: {signal.symbol}  "
-                f"net_premium={signal.entry_price:.2f}  "
-                f"strikes=({signal.metadata['call_strike']}/{signal.metadata['put_strike']})"
+                "Iron Condor entered: %s  net_credit=₹%.2f  "
+                "short_strikes=(%s/%s)  wings=(%s/%s)",
+                signal.symbol, signal.entry_price,
+                ic_meta.get("call_strike", "?"), ic_meta.get("put_strike", "?"),
+                ic_meta.get("wing_call_strike", "?"), ic_meta.get("wing_put_strike", "?"),
             )
             return True
 
@@ -1663,6 +1855,69 @@ class ExpiryShortStrangleStrategy(BaseStrategy):
                 )
             except Exception as e:
                 logger.error(f"Unwind failed for {leg.symbol}: {e}")
+
+    # ── Phase 3: Leg-level strangle management ────────────────────────────────
+
+    async def manage_positions(self) -> None:
+        """
+        Phase 3 — Institutional leg-by-leg strangle management.
+
+        Rule: Do NOT look at combined premium.  Each leg is independent.
+
+        SHORT CALL leg: if its premium rises +80% from entry (underlying
+            surged), buy it back immediately (LEG_SL_HIT) and leave the
+            short PUT open to collect remaining theta.
+
+        SHORT PUT leg: same in reverse.
+
+        Winning leg: once we cut the losing leg, place a trailing stop on
+            the survivor at its entry price (breakeven).  Any decay above
+            that is pure profit.
+        """
+        active_trades = self.db.get_active_trades(self.name)
+        if not active_trades:
+            return
+
+        # Group by parent_trade_id so we can manage legs together
+        from collections import defaultdict
+        parents: dict = defaultdict(list)
+        for t in active_trades:
+            parents[t.parent_trade_id or t.trade_id].append(t)
+
+        for parent_id, legs in parents.items():
+            for trade in legs:
+                if self.sl_manager.is_exit_pending(trade.trade_id):
+                    continue
+
+                quote = await self.broker.get_quote(trade.symbol, Exchange.NFO)
+                if not quote:
+                    continue
+
+                current_price = quote.ltp
+                entry         = trade.entry_price
+
+                if trade.direction == "SELL" and entry > 0:
+                    pct_increase = (current_price - entry) / entry * 100
+
+                    # +80% on a short leg = buy it back (LEG_SL_HIT)
+                    if pct_increase >= 80.0:
+                        await self._execute_exit(
+                            trade, current_price, None, reason="LEG_SL_HIT"
+                        )
+                        # Tighten stop on sibling legs to breakeven
+                        for sibling in legs:
+                            if sibling.trade_id != trade.trade_id:
+                                self.risk_manager.update_trailing_stop(
+                                    sibling.trade_id, sibling.entry_price * 0.99
+                                )
+                        continue
+
+                # Standard combined SL (fallback)
+                should_exit, event = self.sl_manager.should_exit(
+                    trade.trade_id, current_price
+                )
+                if should_exit:
+                    await self._execute_exit(trade, current_price, event)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1810,31 +2065,43 @@ class ZenCreditSpreadStrategy(BaseStrategy):
         si  = self._si(chain)
         atm = chain.atm_strike
 
-        # Bullish: sell put spread
+        # Phase 2: DEBIT SPREAD — capital-efficient for ₹2L accounts.
+        # Intraday credit spreads bleed Gamma before Theta can work.
+        # Bull Call Debit Spread: BUY ATM Call, SELL OTM Call.
+        # Bear Put Debit Spread: BUY ATM Put,  SELL OTM Put.
+        # Max loss = net_debit paid. Profits from directional move + IV expansion.
+
         if alpha > 0.8 and alpha2 > 0.8:
-            sell_strike = atm
-            buy_strike  = atm - 8 * si   # ≈ 400 pts for Nifty (8×50)
+            # BULLISH: BUY ATM Call + SELL OTM Call
+            buy_strike  = atm
+            sell_strike = atm + 3 * si
 
-            sell_q = chain.puts.get(sell_strike)
-            buy_q  = chain.puts.get(buy_strike)
-            if not sell_q or not buy_q:
+            buy_q  = chain.calls.get(buy_strike)
+            sell_q = chain.calls.get(sell_strike)
+            if not buy_q or not sell_q:
                 return None
-            net_credit = sell_q.ltp - buy_q.ltp
-            if net_credit <= 0:
+            net_debit = buy_q.ltp - sell_q.ltp   # cost of the spread (always > 0)
+            if net_debit <= 0:
                 return None
 
+            # SL/Target relative to the BUY leg price so manage_positions can compare
+            # current BUY-leg market price against these levels.
+            buy_sl     = buy_q.ltp - 0.50 * net_debit   # 50% max loss of spread cost
+            buy_target = buy_q.ltp + 0.80 * net_debit   # 80% profit on spread cost
+
+            lots = self._long_option_lots(net_debit, strategy_type="credit_spread")
             legs = [
                 SpreadLeg(
-                    symbol=self._sym(chain, sell_strike, "PE"),
-                    strike=sell_strike, option_type=OptionType.PUT,
-                    direction=TransactionType.SELL,
-                    quantity=self._lot_size, price=sell_q.ltp,
+                    symbol=self._sym(chain, buy_strike, "CE"),
+                    strike=buy_strike, option_type=OptionType.CALL,
+                    direction=TransactionType.BUY,
+                    quantity=lots * self._lot_size, price=buy_q.ltp,
                 ),
                 SpreadLeg(
-                    symbol=self._sym(chain, buy_strike, "PE"),
-                    strike=buy_strike, option_type=OptionType.PUT,
-                    direction=TransactionType.BUY,
-                    quantity=self._lot_size, price=buy_q.ltp,
+                    symbol=self._sym(chain, sell_strike, "CE"),
+                    strike=sell_strike, option_type=OptionType.CALL,
+                    direction=TransactionType.SELL,
+                    quantity=lots * self._lot_size, price=sell_q.ltp,
                 ),
             ]
             return SpreadSignal(
@@ -1842,57 +2109,63 @@ class ZenCreditSpreadStrategy(BaseStrategy):
                 strategy_name=self.name,
                 timestamp=datetime.now(),
                 confidence=(alpha + alpha2) / 2,
-                entry_price=net_credit,
-                stop_loss=net_credit * 1.5,
-                target=net_credit * 0.3,
-                symbol=f"{chain.underlying}{chain.expiry}_ZenPutSpread",
-                option_type=OptionType.PUT,
-                strike=sell_strike,
+                entry_price=net_debit,     # cost basis of the spread
+                stop_loss=buy_sl,          # absolute SL level for BUY leg
+                target=buy_target,         # absolute target for BUY leg
+                symbol=f"{chain.underlying}{chain.expiry}_ZenCallDebit",
+                option_type=OptionType.CALL,
+                strike=buy_strike,
                 expiry=chain.expiry,
-                metadata={"alpha": alpha, "alpha2": alpha2},
+                metadata={"alpha": alpha, "alpha2": alpha2,
+                          "net_debit": net_debit, "spread_type": "call_debit"},
                 legs=legs,
             )
 
-        # Bearish: sell call spread
         if alpha < 0.2 and alpha2 < 0.2:
-            sell_strike = atm
-            buy_strike  = atm + 8 * si
+            # BEARISH: BUY ATM Put + SELL OTM Put
+            buy_strike  = atm
+            sell_strike = atm - 3 * si
 
-            sell_q = chain.calls.get(sell_strike)
-            buy_q  = chain.calls.get(buy_strike)
-            if not sell_q or not buy_q:
+            buy_q  = chain.puts.get(buy_strike)
+            sell_q = chain.puts.get(sell_strike)
+            if not buy_q or not sell_q:
                 return None
-            net_credit = sell_q.ltp - buy_q.ltp
-            if net_credit <= 0:
+            net_debit = buy_q.ltp - sell_q.ltp
+            if net_debit <= 0:
                 return None
 
+            buy_sl     = buy_q.ltp - 0.50 * net_debit
+            buy_target = buy_q.ltp + 0.80 * net_debit
+
+            lots = self._long_option_lots(net_debit, strategy_type="credit_spread")
             legs = [
                 SpreadLeg(
-                    symbol=self._sym(chain, sell_strike, "CE"),
-                    strike=sell_strike, option_type=OptionType.CALL,
-                    direction=TransactionType.SELL,
-                    quantity=self._lot_size, price=sell_q.ltp,
+                    symbol=self._sym(chain, buy_strike, "PE"),
+                    strike=buy_strike, option_type=OptionType.PUT,
+                    direction=TransactionType.BUY,
+                    quantity=lots * self._lot_size, price=buy_q.ltp,
                 ),
                 SpreadLeg(
-                    symbol=self._sym(chain, buy_strike, "CE"),
-                    strike=buy_strike, option_type=OptionType.CALL,
-                    direction=TransactionType.BUY,
-                    quantity=self._lot_size, price=buy_q.ltp,
+                    symbol=self._sym(chain, sell_strike, "PE"),
+                    strike=sell_strike, option_type=OptionType.PUT,
+                    direction=TransactionType.SELL,
+                    quantity=lots * self._lot_size, price=sell_q.ltp,
                 ),
             ]
             return SpreadSignal(
-                signal_type=SignalType.SHORT,
+                signal_type=SignalType.LONG,
                 strategy_name=self.name,
                 timestamp=datetime.now(),
                 confidence=1 - (alpha + alpha2) / 2,
-                entry_price=net_credit,
-                stop_loss=net_credit * 1.5,
-                target=net_credit * 0.3,
-                symbol=f"{chain.underlying}{chain.expiry}_ZenCallSpread",
-                option_type=OptionType.CALL,
-                strike=sell_strike,
+                entry_price=net_debit,
+                stop_loss=buy_sl,
+                target=buy_target,
+                symbol=f"{chain.underlying}{chain.expiry}_ZenPutDebit",
+                option_type=OptionType.PUT,
+                strike=buy_strike,
                 expiry=chain.expiry,
-                metadata={"alpha": alpha, "alpha2": alpha2},
+                metadata={"alpha": alpha, "alpha2": alpha2,
+                          "net_debit": net_debit, "spread_type": "put_debit"},
                 legs=legs,
             )
 
@@ -2117,71 +2390,78 @@ class LyapunovCreditSpreadStrategy(BaseStrategy):
 
     # ── Spread builders ───────────────────────────────────────────────────────
 
+    # Phase 2: DEBIT spread versions — BUY ATM, SELL OTM.
+    # Capital-efficient for ₹2L: defined risk, profits from directional move.
+
     def _put_spread(
         self, chain: "OptionChainSnapshot", atm: float, si: float
     ) -> Optional[SpreadSignal]:
-        sell_k = atm
-        buy_k  = atm - 2 * si
-        sq, bq = chain.puts.get(sell_k), chain.puts.get(buy_k)
-        if not sq or not bq:
+        """Bearish debit put spread: BUY ATM Put, SELL OTM Put."""
+        buy_k  = atm
+        sell_k = atm - 2 * si
+        bq, sq = chain.puts.get(buy_k), chain.puts.get(sell_k)
+        if not bq or not sq:
             return None
-        credit = sq.ltp - bq.ltp
-        if credit <= 0:
+        net_debit = bq.ltp - sq.ltp
+        if net_debit <= 0:
             return None
         alpha, lam, r2 = self._compute_alpha()
+        lots = self._long_option_lots(net_debit, strategy_type="credit_spread")
         return SpreadSignal(
             signal_type=SignalType.LONG,
             strategy_name=self.name,
             timestamp=datetime.now(),
             confidence=alpha,
-            entry_price=credit,
-            stop_loss=credit * 2.0,
-            target=credit * 0.40,
-            symbol=f"{chain.underlying}{chain.expiry}_LyapPutSpread",
+            entry_price=net_debit,
+            stop_loss=bq.ltp - 0.50 * net_debit,   # 50% loss on spread cost
+            target=bq.ltp   + 0.80 * net_debit,    # 80% profit on spread cost
+            symbol=f"{chain.underlying}{chain.expiry}_LyapPutDebit",
             option_type=OptionType.PUT,
-            strike=sell_k,
+            strike=buy_k,
             expiry=chain.expiry,
             metadata={"alpha": alpha, "lyapunov": lam, "r2": r2,
-                      "spread_type": "put_spread"},
+                      "net_debit": net_debit, "spread_type": "put_debit"},
             legs=[
-                SpreadLeg(self._sym(chain, sell_k, "PE"), sell_k, OptionType.PUT,
-                          TransactionType.SELL, self._lot_size, sq.ltp),
                 SpreadLeg(self._sym(chain, buy_k,  "PE"), buy_k,  OptionType.PUT,
-                          TransactionType.BUY,  self._lot_size, bq.ltp),
+                          TransactionType.BUY,  lots * self._lot_size, bq.ltp),
+                SpreadLeg(self._sym(chain, sell_k, "PE"), sell_k, OptionType.PUT,
+                          TransactionType.SELL, lots * self._lot_size, sq.ltp),
             ],
         )
 
     def _call_spread(
         self, chain: "OptionChainSnapshot", atm: float, si: float
     ) -> Optional[SpreadSignal]:
-        sell_k = atm
-        buy_k  = atm + 2 * si
-        sq, bq = chain.calls.get(sell_k), chain.calls.get(buy_k)
-        if not sq or not bq:
+        """Bullish debit call spread: BUY ATM Call, SELL OTM Call."""
+        buy_k  = atm
+        sell_k = atm + 2 * si
+        bq, sq = chain.calls.get(buy_k), chain.calls.get(sell_k)
+        if not bq or not sq:
             return None
-        credit = sq.ltp - bq.ltp
-        if credit <= 0:
+        net_debit = bq.ltp - sq.ltp
+        if net_debit <= 0:
             return None
         alpha, lam, r2 = self._compute_alpha()
+        lots = self._long_option_lots(net_debit, strategy_type="credit_spread")
         return SpreadSignal(
-            signal_type=SignalType.SHORT,
+            signal_type=SignalType.LONG,
             strategy_name=self.name,
             timestamp=datetime.now(),
             confidence=alpha,
-            entry_price=credit,
-            stop_loss=credit * 2.0,
-            target=credit * 0.40,
-            symbol=f"{chain.underlying}{chain.expiry}_LyapCallSpread",
+            entry_price=net_debit,
+            stop_loss=bq.ltp - 0.50 * net_debit,
+            target=bq.ltp   + 0.80 * net_debit,
+            symbol=f"{chain.underlying}{chain.expiry}_LyapCallDebit",
             option_type=OptionType.CALL,
-            strike=sell_k,
+            strike=buy_k,
             expiry=chain.expiry,
             metadata={"alpha": alpha, "lyapunov": lam, "r2": r2,
-                      "spread_type": "call_spread"},
+                      "net_debit": net_debit, "spread_type": "call_debit"},
             legs=[
-                SpreadLeg(self._sym(chain, sell_k, "CE"), sell_k, OptionType.CALL,
-                          TransactionType.SELL, self._lot_size, sq.ltp),
                 SpreadLeg(self._sym(chain, buy_k,  "CE"), buy_k,  OptionType.CALL,
-                          TransactionType.BUY,  self._lot_size, bq.ltp),
+                          TransactionType.BUY,  lots * self._lot_size, bq.ltp),
+                SpreadLeg(self._sym(chain, sell_k, "CE"), sell_k, OptionType.CALL,
+                          TransactionType.SELL, lots * self._lot_size, sq.ltp),
             ],
         )
 

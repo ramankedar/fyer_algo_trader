@@ -418,7 +418,8 @@ def _strategy_metrics(pnls: list, initial_capital: float = 500_000) -> dict:
     wr     = len(wins) / max(1, len(pnls)) * 100
     aw     = float(np.mean(wins))   if wins   else 0.0
     al     = float(np.mean(losses)) if losses else 0.0
-    pf     = sum(wins) / abs(sum(losses)) if wins and losses else float("inf")
+    loss_sum = abs(sum(losses)) if losses else 0.0
+    pf       = sum(wins) / loss_sum if wins and loss_sum > 1e-9 else float("inf")
     exp    = (wr / 100 * aw) + ((1 - wr / 100) * al)
     sharpe = _sharpe(pnls, initial_capital)
     # Drawdown as % of initial capital — comparable to the portfolio-level figure
@@ -564,6 +565,23 @@ def generate_report(
 
 # ── Main Backtest Engine ──────────────────────────────────────────────────────
 
+STRATEGY_NAMES = {
+    "FixedRR_1to3":           "FixedRR_1to3",
+    "fixedrr":                "FixedRR_1to3",
+    "CurvatureCreditSpread":  "CurvatureCreditSpread",
+    "curvature":              "CurvatureCreditSpread",
+    "SkewHunter":             "SkewHunter",
+    "skewhunter":             "SkewHunter",
+    "ExpiryShortStrangle":    "ExpiryShortStrangle",
+    "strangle":               "ExpiryShortStrangle",
+    "ironcondor":             "ExpiryShortStrangle",
+    "ZenCreditSpread":        "ZenCreditSpread",
+    "zen":                    "ZenCreditSpread",
+    "LyapunovCreditSpread":   "LyapunovCreditSpread",
+    "lyapunov":               "LyapunovCreditSpread",
+}
+
+
 async def run_backtest(
     instrument_key:  str,
     start_date:      str,
@@ -572,6 +590,7 @@ async def run_backtest(
     risk_free_rate:  float = 0.065,
     output_csv:      str   = "backtest_results.csv",
     output_dir:      str   = "backtest_results_output",
+    strategy_filter: Optional[str] = None,   # None = run all; else one strategy name
 ) -> dict:
     spec = INSTRUMENTS[instrument_key]
     # ── Check for real NSE option cache ──────────────────────────────────────
@@ -654,6 +673,14 @@ async def run_backtest(
             max_position_size=spec.lot_size * 10,
             max_open_positions=4,
             position_size_per_trade=spec.lot_size,
+            # Phase 1/3: Per-strategy capital sleeves — read from env (set by CLI --capital)
+            skewhunter_allocated_capital=float(
+                os.environ.get("SLEEVE_SKEWHUNTER", "100000")),
+            strangle_allocated_capital=float(
+                os.environ.get("SLEEVE_STRANGLE", "300000")),
+            credit_spread_allocated_capital=float(
+                os.environ.get("SLEEVE_CREDIT_SPREAD", "100000")),
+            risk_per_trade_percent=2.0,
         ),
         on_risk_event=lambda e, d: logger.warning("Risk event: %s", e.value),
     )
@@ -682,8 +709,25 @@ async def run_backtest(
     strat_strangle = ExpiryShortStrangleStrategy(cfg, bs, db, risk, broker)
     strat_zen      = ZenCreditSpreadStrategy(cfg, bs, db, risk, broker)
     strat_lyap     = LyapunovCreditSpreadStrategy(cfg, bs, db, risk, broker)
-    all_strategies = [strat_fixed, strat_curv, strat_skew,
-                      strat_strangle, strat_zen, strat_lyap]
+
+    _all = [strat_fixed, strat_curv, strat_skew, strat_strangle, strat_zen, strat_lyap]
+
+    # ── Strategy filter: run only the requested strategy ─────────────────────
+    if strategy_filter:
+        canonical = STRATEGY_NAMES.get(strategy_filter) or STRATEGY_NAMES.get(
+            strategy_filter.lower()
+        )
+        if not canonical:
+            raise ValueError(
+                f"Unknown strategy '{strategy_filter}'. "
+                f"Valid names: {sorted(set(STRATEGY_NAMES.values()))}"
+            )
+        all_strategies = [s for s in _all if s.name == canonical]
+        if not all_strategies:
+            raise ValueError(f"Strategy '{canonical}' not found in instantiated list.")
+        print(f"  Strategy filter : {canonical} only")
+    else:
+        all_strategies = _all
 
     # Monkey-patch time checks: BacktestEngine controls windows via bar_time.
     for s in all_strategies:
@@ -730,15 +774,12 @@ async def run_backtest(
                           f"total_OI={stats.get('total_oi',0):,}  "
                           f"spot=₹{stats.get('spot',0):,.0f}  VIX={vix:.1f}%")
 
-        # Reset daily counters at the start of each simulated trading day.
-        # Mirrors the live-trading behaviour where the daily loss limit
-        # resets each morning.  Also clears unrealized so the check in
-        # can_enter_position() starts fresh and doesn't block the first
-        # trade of the new day.
+        # Reset daily counters and Phase 4 kill-switch each morning.
         with risk._lock:
             risk._metrics.realized_pnl       = 0.0
             risk._metrics.unrealized_pnl     = 0.0
             risk._metrics.daily_loss_percent = 0.0
+        risk.reset_daily_kill_switch()   # Phase 4: fresh start each day
 
         for bar in day_bars:
             ts       = bar["timestamp"]
@@ -753,15 +794,97 @@ async def run_backtest(
             total_bars += 1
 
             # Track spot price every bar for Curvature intraday momentum signal.
-            # evaluate() only runs 3:00-3:25 PM — without this, spot_prices has
-            # only ~25 bars and intraday_ret ≈ 0 → signal never fires.
             strat_curv._track_spot(chain)
 
+            # ── Phase 4: Intrabar high/low trailing stop check ───────────
+            # Using close price alone masks extreme intrabar volatility.
+            # Use bar['high'] and bar['low'] to trigger SL/target/trailing
+            # stop before candle close, matching real market behaviour.
+            bar_high = bar.get("high", bar["close"])
+            bar_low  = bar.get("low",  bar["close"])
+
+            for active_trade in db.get_active_trades():
+                if active_trade.direction != "BUY":
+                    continue
+                entry = active_trade.entry_price
+                if entry <= 0:
+                    continue
+
+                # Check if bar's LOW hit the stop loss
+                pos = risk.get_position(active_trade.trade_id)
+                current_sl = pos.stop_loss if pos else active_trade.stop_loss
+                if bar_low <= current_sl:
+                    px = max(bar_low, current_sl)   # fill at SL (realistic)
+                    db.update_trade_status(
+                        active_trade.trade_id, TradeStatus.CLOSED,
+                        exit_price=px, exit_reason="INTRABAR_SL",
+                    )
+                    pnl = (px - entry) * active_trade.quantity
+                    risk.remove_position(active_trade.trade_id, pnl)
+                    db.release_trade_lock(active_trade.strategy_name, active_trade.symbol)
+                    continue
+
+                # Check if bar's HIGH hit the target
+                if active_trade.target and bar_high >= active_trade.target:
+                    px = min(bar_high, active_trade.target)
+                    db.update_trade_status(
+                        active_trade.trade_id, TradeStatus.CLOSED,
+                        exit_price=px, exit_reason="INTRABAR_TARGET",
+                    )
+                    pnl = (px - entry) * active_trade.quantity
+                    risk.remove_position(active_trade.trade_id, pnl)
+                    db.release_trade_lock(active_trade.strategy_name, active_trade.symbol)
+                    continue
+
+                # Update dynamic trailing stop using bar's HIGH
+                from strategies import BaseStrategy as _BS
+                new_sl = _BS._dynamic_trailing_sl(entry, bar_high)
+                if pos and new_sl > pos.stop_loss:
+                    risk.update_trailing_stop(active_trade.trade_id, new_sl)
+
+            # Phase 4: Intraday kill-switch — checked EVERY BAR using bar['low']
+            # for worst-case intrabar marking (close prices hide intrabar extremes).
+            # Combined capital = sum of all three strategy sleeves.
+            combined_capital = (
+                getattr(risk.thresholds, "skewhunter_allocated_capital",   100_000)
+                + getattr(risk.thresholds, "strangle_allocated_capital",   300_000)
+                + getattr(risk.thresholds, "credit_spread_allocated_capital", 100_000)
+            )
+            risk.check_intraday_kill_switch(
+                bar_high=bar.get("high", bar["close"]),
+                bar_low =bar.get("low",  bar["close"]),
+                combined_capital=combined_capital,
+            )
+
+            # Phase 4: EMERGENCY_SQUARE_OFF — exit all positions at bar['low']
+            # (worst-case intrabar fill for long positions)
+            if risk._kill_switch_active:
+                for kst in db.get_active_trades():
+                    # Fill at bar_low for BUY positions (worst realistic exit)
+                    # Fill at bar_high for SELL positions
+                    if kst.direction == "BUY":
+                        kpx = bar.get("low", broker.price_of(kst.symbol) or kst.entry_price)
+                    else:
+                        kpx = bar.get("high", broker.price_of(kst.symbol) or kst.entry_price)
+                    kpx = max(0.05, kpx)   # floor at tick size
+                    db.update_trade_status(
+                        kst.trade_id, TradeStatus.SQUARED_OFF,
+                        exit_price=kpx, exit_reason="EMERGENCY_SQUARE_OFF",
+                    )
+                    km  = 1 if kst.direction == "BUY" else -1
+                    kpl = (kpx - kst.entry_price) * kst.quantity * km
+                    risk.remove_position(kst.trade_id, kpl)
+                    db.release_trade_lock(kst.strategy_name, kst.symbol)
+
             # ── Strategy entry windows ────────────────────────────────────
+            # Each block guards on `in all_strategies` so filtered runs skip
+            # strategies that weren't requested via --strategy.
 
             # FixedRR, SkewHunter, Zen, Lyapunov — main strategy window
             if T_STRAT_START <= bar_time <= T_STRAT_END:
                 for strategy in [strat_fixed, strat_skew, strat_zen, strat_lyap]:
+                    if strategy not in all_strategies:
+                        continue
                     try:
                         sig = await strategy.evaluate(chain)
                         if sig:
@@ -769,23 +892,25 @@ async def run_backtest(
                     except Exception as e:
                         logger.debug("%s eval: %s", strategy.name, e)
 
-            # Strangle enters 10:30-11:15 AM (after morning volatility settles)
+            # Strangle / Iron Condor enters 10:30-11:15 AM
             if T_STRANGLE_START <= bar_time <= T_STRANGLE_END:
-                try:
-                    sig = await strat_strangle.evaluate(chain)
-                    if sig:
-                        await strat_strangle.execute_signal(sig)
-                except Exception as e:
-                    logger.debug("Strangle eval: %s", e)
+                if strat_strangle in all_strategies:
+                    try:
+                        sig = await strat_strangle.evaluate(chain)
+                        if sig:
+                            await strat_strangle.execute_signal(sig)
+                    except Exception as e:
+                        logger.debug("Strangle eval: %s", e)
 
             # Curvature fires in the overnight entry window (15:00-15:25)
             if T_CURV_START <= bar_time <= T_CURV_END:
-                try:
-                    sig = await strat_curv.evaluate(chain)
-                    if sig:
-                        await strat_curv.execute_signal(sig)
-                except Exception as e:
-                    logger.debug("Curvature eval: %s", e)
+                if strat_curv in all_strategies:
+                    try:
+                        sig = await strat_curv.evaluate(chain)
+                        if sig:
+                            await strat_curv.execute_signal(sig)
+                    except Exception as e:
+                        logger.debug("Curvature eval: %s", e)
 
             # ── Position management (every bar) ──────────────────────────
 
@@ -847,6 +972,16 @@ def main() -> None:
         choices=list(INSTRUMENTS.keys()),
         help="Which index to backtest (default: nifty)",
     )
+    parser.add_argument(
+        "--strategy", default=None,
+        metavar="NAME",
+        help=(
+            "Run a single strategy only. "
+            "Valid names: SkewHunter, FixedRR_1to3, CurvatureCreditSpread, "
+            "ExpiryShortStrangle, ZenCreditSpread, LyapunovCreditSpread  "
+            "(aliases: skewhunter, fixedrr, curvature, strangle, zen, lyapunov)"
+        ),
+    )
     parser.add_argument("--start",  default="2025-01-01", metavar="YYYY-MM-DD")
     parser.add_argument("--end",    default="2025-05-30", metavar="YYYY-MM-DD")
     parser.add_argument("--capital", type=float, default=500_000,
@@ -855,6 +990,8 @@ def main() -> None:
                         help="Output CSV path")
     parser.add_argument("--list-instruments", action="store_true",
                         help="Print all supported instruments and exit")
+    parser.add_argument("--list-strategies", action="store_true",
+                        help="Print all supported strategy names and exit")
     args = parser.parse_args()
 
     if args.list_instruments:
@@ -868,12 +1005,25 @@ def main() -> None:
         print()
         return
 
+    if args.list_strategies:
+        print("\n  Available strategies (--strategy NAME):\n")
+        seen = set()
+        for alias, canonical in sorted(STRATEGY_NAMES.items()):
+            if canonical not in seen:
+                print(f"  {canonical}")
+                seen.add(canonical)
+        print("\n  Aliases accepted: "
+              + ", ".join(k for k in STRATEGY_NAMES if k not in seen))
+        print()
+        return
+
     asyncio.run(run_backtest(
         instrument_key=args.instrument,
         start_date=args.start,
         end_date=args.end,
         initial_capital=args.capital,
         output_csv=args.output,
+        strategy_filter=args.strategy,
     ))
 
 

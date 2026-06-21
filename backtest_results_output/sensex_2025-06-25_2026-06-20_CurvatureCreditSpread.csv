@@ -1,0 +1,2 @@
+strategy_name,symbol,option_type,strike,direction,entry_time,exit_time,entry_price,exit_price,quantity,pnl,exit_reason
+CurvatureCreditSpread,BFO:SENSEX27JUN2584000CE,CE,84000.0,BUY,2026-06-20T23:41:13.377630,2026-06-20T23:41:13.380831,231.08,19.277999999999988,10,-2118.0200000000004,INTRABAR_TARGET

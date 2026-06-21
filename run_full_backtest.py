@@ -159,8 +159,21 @@ async def _main(args):
 
     end_date   = datetime.today().strftime("%Y-%m-%d")
     start_date = (datetime.today() - timedelta(days=args.months * 30)).strftime("%Y-%m-%d")
+
+    # Phase 1: --capital scales all three sleeves proportionally.
+    # Default pool ₹5L splits as: SkewHunter=₹1L, Strangle=₹3L, Spreads=₹1L.
+    # At ₹2L: SkewHunter=₹40K, Strangle=₹1.2L, Spreads=₹40K.
+    DEFAULT_POOL   = 500_000.0
+    scale          = args.capital / DEFAULT_POOL
+    os.environ["SLEEVE_SKEWHUNTER"]    = str(int(100_000 * scale))
+    os.environ["SLEEVE_STRANGLE"]      = str(int(300_000 * scale))
+    os.environ["SLEEVE_CREDIT_SPREAD"] = str(int(100_000 * scale))
+
     print(f"  Period   : {start_date}  →  {end_date}")
-    print(f"  Capital  : ₹{args.capital:,.0f}")
+    print(f"  Capital  : ₹{args.capital:,.0f}  "
+          f"(SkewHunter ₹{int(100_000*scale):,}  "
+          f"| Strangle ₹{int(300_000*scale):,}  "
+          f"| Spreads ₹{int(100_000*scale):,})")
     print(f"  Output   : {OUTPUT_DIR}/\n")
 
     from backtest import run_backtest
@@ -199,7 +212,8 @@ def main():
         description="Full 9-combination backtest (3 strategies × 3 instruments)"
     )
     p.add_argument("--months",  type=int,   default=12)
-    p.add_argument("--capital", type=float, default=500_000)
+    p.add_argument("--capital", type=float, default=200_000,
+                   help="Starting capital in INR (default: ₹2L — Phase 4 constraint)")
     asyncio.run(_main(p.parse_args()))
 
 

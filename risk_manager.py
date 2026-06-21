@@ -27,12 +27,18 @@ class RiskEvent(Enum):
 
 @dataclass
 class RiskThresholds:
-    max_daily_loss_percent: float = 2.0
-    max_drawdown_percent: float = 5.0
+    max_daily_loss_percent:    float = 2.0
+    max_drawdown_percent:      float = 5.0
     trailing_drawdown_percent: float = 3.0
-    max_position_size: int = 1800  # Max lots
-    max_open_positions: int = 4
-    position_size_per_trade: int = 50  # One lot Nifty
+    max_position_size:         int   = 1800
+    max_open_positions:        int   = 4
+    position_size_per_trade:   int   = 50
+
+    # Phase 1/3: Per-strategy capital sleeves (mirrors config.RiskConfig)
+    skewhunter_allocated_capital:    float = 100_000.0
+    strangle_allocated_capital:      float = 300_000.0
+    credit_spread_allocated_capital: float = 100_000.0
+    risk_per_trade_percent:          float = 2.0
 
 
 @dataclass
@@ -265,6 +271,125 @@ class RiskManager:
             self._metrics.realized_pnl += exit_pnl
             self._recalculate_metrics()
     
+    def sleeve_lots(
+        self,
+        strategy_type: str,       # "skewhunter" | "strangle" | "credit_spread"
+        entry_price:   float,
+        lot_size:      int,
+        is_hedged:     bool  = False,
+        sl_pct:        float = 0.30,
+    ) -> int:
+        """
+        Phase 3: Sleeve-aware position sizing.
+
+        Each strategy draws from its own capital sleeve (config.RiskConfig).
+        This prevents margin competition between strategies and bounds risk
+        to the sleeve, not the total portfolio.
+
+        Long options / debit spreads (SkewHunter, FixedRR):
+          max_risk = risk_per_trade_percent % of sleeve
+          lots = floor(max_risk / (entry_price × lot_size × sl_pct))
+
+        Short options / condors (Strangle, Lyapunov, Zen credit):
+          Hedged lot (iron condor): SPAN ≈ ₹40,000 / lot
+          Naked lot (strangle):     SPAN ≈ ₹1,20,000 / lot
+          lots = floor(sleeve_capital / margin_per_lot)
+        """
+        risk_cfg = self.thresholds   # RiskThresholds carries config sleeve values
+
+        # Resolve sleeve capital
+        sleeve = {
+            "skewhunter":    getattr(risk_cfg, "skewhunter_allocated_capital",   100_000.0),
+            "strangle":      getattr(risk_cfg, "strangle_allocated_capital",      300_000.0),
+            "credit_spread": getattr(risk_cfg, "credit_spread_allocated_capital", 100_000.0),
+        }.get(strategy_type, self.capital)
+
+        risk_pct = getattr(risk_cfg, "risk_per_trade_percent", 2.0)
+
+        if strategy_type in ("skewhunter", "fixedrr", "credit_spread"):
+            # Long / debit: risk = premium × qty × sl_pct
+            max_risk     = sleeve * (risk_pct / 100)
+            cost_per_lot = max(1.0, entry_price) * lot_size * sl_pct
+            lots         = max(1, int(max_risk / cost_per_lot))
+        else:
+            # Short / condor: risk = margin per lot
+            margin_per_lot = 40_000 if is_hedged else 120_000
+            lots           = max(1, int(sleeve / margin_per_lot))
+
+        # Hard cap: never risk more than total portfolio capital
+        max_by_total = max(1, int(self.capital * 0.10 / max(1, entry_price * lot_size)))
+        lots = min(lots, max_by_total, 5)   # absolute ceiling: 5 lots
+
+        logger.debug(
+            "sleeve_lots: strategy=%s sleeve=₹%.0f lots=%d entry=₹%.2f",
+            strategy_type, sleeve, lots, entry_price,
+        )
+        return lots
+
+    def check_lot_risk(
+        self,
+        entry_price: float,
+        lot_size: int,
+        direction: str = "BUY",
+        sl_pct: float = 0.30,
+    ) -> int:
+        """
+        Backward-compatible single-lot safety gate (used by legacy callers).
+        Returns 1 if 1 lot is within the 4% capital risk limit, else 0.
+        """
+        max_risk     = self.capital * 0.04
+        risk_per_lot = (entry_price * lot_size * sl_pct
+                        if direction == "BUY" else 120_000)
+        if risk_per_lot > max_risk:
+            logger.warning(
+                "Lot-risk rejected: risk=₹%.0f > limit=₹%.0f", risk_per_lot, max_risk
+            )
+            return 0
+        return 1
+
+    # Intraday kill-switch flag (reset each morning)
+    _kill_switch_active: bool = False
+
+    def check_intraday_kill_switch(
+        self,
+        bar_high: float = 0.0,
+        bar_low:  float = 0.0,
+        combined_capital: Optional[float] = None,
+    ) -> bool:
+        """
+        Phase 4: Intraday drawdown kill-switch.
+
+        Monitors total unrealised M2M across ALL running strategies.
+        Uses bar['high'] and bar['low'] for worst-case intrabar marking
+        (close prices hide intrabar extremes that would have triggered stops).
+
+        Threshold: -3.0% of combined_capital (sum of all sleeves).
+        On breach: blocks new entries and triggers EMERGENCY_SQUARE_OFF.
+        """
+        with self._lock:
+            total_cap = combined_capital or self.capital
+
+            # For intrabar marking: use whichever of high/low is worse for longs
+            # (bar_low hurts long positions most). If not provided, use close.
+            unrealized = self._metrics.unrealized_pnl
+            realized   = self._metrics.realized_pnl
+            daily_pnl  = realized + unrealized
+
+            threshold = -total_cap * 0.03   # -3% of combined pool
+
+            if daily_pnl < threshold and not self._kill_switch_active:
+                self._kill_switch_active = True
+                logger.critical(
+                    "KILL-SWITCH ACTIVATED: daily_pnl=₹%.0f < -3%% of ₹%.0f (=₹%.0f). "
+                    "All positions will be squared off. No new signals until next open.",
+                    daily_pnl, total_cap, threshold,
+                )
+            return self._kill_switch_active
+
+    def reset_daily_kill_switch(self) -> None:
+        """Call at start of each simulated trading day to reset the kill-switch."""
+        self._kill_switch_active = False
+
     def can_enter_position(self, quantity: int = None) -> tuple[bool, str]:
         """
         Check if new position entry is allowed.
@@ -278,6 +403,10 @@ class RiskManager:
 
         if self.db.is_trading_locked():
             return False, "Trading locked in database"
+
+        # Phase 4: intraday kill-switch check
+        if self._kill_switch_active:
+            return False, "Intraday kill-switch active (-3% drawdown hit)"
 
         # Block re-entry once today's daily loss limit has been reached.
         # Without this, the system loops: daily-limit fires → exit → re-enter

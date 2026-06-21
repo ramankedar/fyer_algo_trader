@@ -1,7 +1,7 @@
 Strategy,NIFTY_Trades,BANKNIFTY_Trades,SENSEX_Trades,NIFTY_WinRate%,BANKNIFTY_WinRate%,SENSEX_WinRate%,NIFTY_PnL%,BANKNIFTY_PnL%,SENSEX_PnL%,NIFTY_Sharpe,BANKNIFTY_Sharpe,SENSEX_Sharpe,NIFTY_PF,BANKNIFTY_PF,SENSEX_PF,NIFTY_MaxDD%,BANKNIFTY_MaxDD%,SENSEX_MaxDD%
-FixedRR_1to3,302,196,42,28.48,30.1,28.57,-16.79,-9.15,-1.1,-3.57,-2.62,-1.65,0.57,0.65,0.77,17.18,11.7,2.49
-CurvatureCreditSpread,,,,,,,,,,,,,,,,,,
-SkewHunter,2,,,50.0,,,-0.24,,,-6.68,,,0.25,,,0.33,,
-ExpiryShortStrangle,98,66,16,66.33,83.33,56.25,17.45,17.88,0.74,5.22,11.73,1.37,2.26,6.54,1.29,1.58,1.73,2.24
-ZenCreditSpread,210,66,16,44.29,45.45,31.25,2.67,-2.05,-0.69,0.8,-1.8,-3.2,1.14,0.76,0.59,1.41,2.34,0.69
-LyapunovCreditSpread,310,142,16,46.77,46.48,43.75,-1.8,-3.85,-0.38,-0.3,-1.77,-1.4,0.95,0.73,0.79,3.08,4.44,0.57
+FixedRR_1to3,2,2,2,100.0,100.0,100.0,0.35,0.57,0.85,3987.36,1019.46,18218.13,inf,inf,inf,0.0,0.0,0.0
+CurvatureCreditSpread,1,3,1,0.0,33.33,0.0,-0.77,-4.38,-1.06,0.0,-16.43,0.0,inf,0.03,inf,0.77,4.38,1.06
+SkewHunter,,,,,,,,,,,,,,,,,,
+ExpiryShortStrangle,4,4,,100.0,75.0,,2.73,4.06,,25.23,11.43,,inf,283.01,,0.0,0.01,
+ZenCreditSpread,4,4,2,75.0,50.0,100.0,4.4,-1.55,3.88,3.88,-1.03,12.91,1.79,0.84,inf,5.06,8.13,0.0
+LyapunovCreditSpread,2,2,2,100.0,50.0,100.0,8.5,2.94,3.29,133.32,7.28,21.31,inf,4.68,inf,0.0,0.77,0.0
