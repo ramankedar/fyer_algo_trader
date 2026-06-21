@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "algo-trader-platform"
+version = "0.1.0"
+description = "Production-grade options algo trading platform for Indian markets"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "pandas>=2.0",
+    "scikit-learn>=1.3",
+    "optuna>=3.3",
+    "rich>=13.0",
+    "httpx>=0.24",
+    "websockets>=11.0",
+    "pyotp>=2.8",
+    "python-dotenv>=1.0",
+    "fyers-apiv3",
+]
+
+[project.scripts]
+# Run as: algo-trade backtest --strategy B --start 2020-01-01
+algo-trade = "algo_platform.run:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["algo_platform*"]

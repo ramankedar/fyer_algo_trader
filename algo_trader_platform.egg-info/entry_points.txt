@@ -1,0 +1,2 @@
+[console_scripts]
+algo-trade = algo_platform.run:main

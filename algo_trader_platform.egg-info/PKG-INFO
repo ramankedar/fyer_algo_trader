@@ -1,0 +1,16 @@
+Metadata-Version: 2.4
+Name: algo-trader-platform
+Version: 0.1.0
+Summary: Production-grade options algo trading platform for Indian markets
+Requires-Python: >=3.10
+Requires-Dist: numpy>=1.24
+Requires-Dist: scipy>=1.10
+Requires-Dist: pandas>=2.0
+Requires-Dist: scikit-learn>=1.3
+Requires-Dist: optuna>=3.3
+Requires-Dist: rich>=13.0
+Requires-Dist: httpx>=0.24
+Requires-Dist: websockets>=11.0
+Requires-Dist: pyotp>=2.8
+Requires-Dist: python-dotenv>=1.0
+Requires-Dist: fyers-apiv3
