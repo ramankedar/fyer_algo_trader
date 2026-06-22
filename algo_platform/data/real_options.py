@@ -35,10 +35,16 @@ from algo_platform.core.types import MarketBar
 
 logger = logging.getLogger("algo_platform.data.real_options")
 
-# NSE bhavcopy URL (free, no login needed)
-_NSE_URL = (
+# NSE bhavcopy URLs — NSE changed format in mid-2024
+# New format (Jul 2024+):  BhavCopy_NSE_FO_0_0_0_{YYYYMMDD}_F_0000.csv.zip
+# Old format (pre-Jul 2024): fo{DDMMMYYYY}bhav.csv.zip  (different archive path)
+_NSE_URL_NEW = (
     "https://archives.nseindia.com/content/fo/"
     "BhavCopy_NSE_FO_0_0_0_{date}_F_0000.csv.zip"
+)
+_NSE_URL_OLD = (
+    "https://archives.nseindia.com/content/historical/DERIVATIVES/"
+    "{year}/{month}/fo{ddmmmyyyy}bhav.csv.zip"
 )
 _HEADERS = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"}
 
@@ -98,26 +104,38 @@ class NseBhavcopDownloader:
         if path.exists():
             return False   # already cached
 
-        url = _NSE_URL.format(date=d.strftime("%Y%m%d"))
-        try:
-            r = httpx.get(url, headers=_HEADERS, timeout=20, follow_redirects=True)
-            if r.status_code != 200:
-                logger.warning("Bhavcopy %s: HTTP %d", d, r.status_code)
-                return False
+        # Try new format first (Jul 2024+), then fall back to old format
+        urls = [
+            _NSE_URL_NEW.format(date=d.strftime("%Y%m%d")),
+            _NSE_URL_OLD.format(
+                year=d.strftime("%Y"),
+                month=d.strftime("%b").upper(),
+                ddmmmyyyy=d.strftime("%d%b%Y").upper(),
+            ),
+        ]
 
-            with zipfile.ZipFile(io.BytesIO(r.content)) as z:
-                with z.open(z.namelist()[0]) as f:
-                    df = pd.read_csv(f)
+        for url in urls:
+            try:
+                r = httpx.get(url, headers=_HEADERS, timeout=20, follow_redirects=True)
+                if r.status_code != 200:
+                    continue   # try next URL
 
-            # Normalise column names across NSE format versions
-            df = self._normalise(df, d)
-            if df is not None:
-                df.to_parquet(path, index=False)
-                logger.info("Saved bhavcopy %s (%d rows)", d, len(df))
-                time.sleep(sleep_sec)
-                return True
-        except Exception as exc:
-            logger.warning("Bhavcopy %s failed: %s", d, exc)
+                with zipfile.ZipFile(io.BytesIO(r.content)) as z:
+                    with z.open(z.namelist()[0]) as f:
+                        df = pd.read_csv(f)
+
+                # Normalise column names across NSE format versions
+                df = self._normalise(df, d)
+                if df is not None:
+                    df.to_parquet(path, index=False)
+                    logger.info("Saved bhavcopy %s (%d rows) [%s]",
+                                d, len(df), "new" if "BhavCopy" in url else "old")
+                    time.sleep(sleep_sec)
+                    return True
+            except Exception as exc:
+                logger.debug("Bhavcopy %s url=%s failed: %s", d, url[:60], exc)
+
+        logger.warning("Bhavcopy %s: all URLs failed", d)
         return False
 
     @staticmethod
@@ -142,24 +160,37 @@ class NseBhavcopDownloader:
                     "spot":         df["UndrlygPric"].astype(float),
                     "trade_date":   trade_date,
                 })
-            # Older format
+            # Older format (pre-mid 2024)
             elif "SYMBOL" in df.columns:
+                import numpy as np
+                n = len(df)
+                # Safely get optional columns — default to zeros array, not scalar
+                def _col(col, fallback=None):
+                    if col in df.columns:
+                        return df[col].astype(float)
+                    return pd.Series(np.zeros(n) if fallback is None
+                                     else np.full(n, fallback, dtype=float))
+
                 out = pd.DataFrame({
                     "underlying":   df["SYMBOL"],
-                    "expiry":       pd.to_datetime(df["EXPIRY_DT"], format="%d-%b-%Y").dt.date,
-                    "strike":       df["STRIKE_PR"].astype(float),
+                    "expiry":       pd.to_datetime(df["EXPIRY_DT"],
+                                                   format="%d-%b-%Y", dayfirst=True).dt.date,
+                    "strike":       _col("STRIKE_PR"),
                     "option_type":  df["OPTION_TYP"],
-                    "open":         df["OPEN"].astype(float),
-                    "high":         df["HIGH"].astype(float),
-                    "low":          df["LOW"].astype(float),
-                    "close":        df["CLOSE"].astype(float),
-                    "settlement":   df.get("SETTLE_PR", df["CLOSE"]).astype(float),
-                    "oi":           df["OPEN_INT"].astype(float),
-                    "delta_oi":     df.get("CHG_IN_OI", 0).astype(float),
-                    "volume":       df["CONTRACTS"].astype(float),
-                    "spot":         df.get("UNDERLYING_VALUE", 0).astype(float),
+                    "open":         _col("OPEN"),
+                    "high":         _col("HIGH"),
+                    "low":          _col("LOW"),
+                    "close":        _col("CLOSE"),
+                    "settlement":   _col("SETTLE_PR") if "SETTLE_PR" in df.columns
+                                    else _col("CLOSE"),
+                    "oi":           _col("OPEN_INT"),
+                    "delta_oi":     _col("CHG_IN_OI"),
+                    "volume":       _col("CONTRACTS"),
+                    "spot":         _col("UNDERLYING_VALUE"),   # often absent in old fmt
                     "trade_date":   trade_date,
                 })
+                # Filter only options (OPTION_TYP = CE or PE); old fmt has futures too
+                out = out[out["option_type"].isin(["CE", "PE"])]
             else:
                 logger.warning("Unknown bhavcopy format on %s", trade_date)
                 return None

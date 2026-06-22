@@ -7,6 +7,9 @@ from .iron_condor import IronCondorStrategy
 from .short_strangle import ShortStrangleStrategy
 from .iron_butterfly import IronButterflyStrategy
 from .adaptive_strangle import AdaptiveStrangleStrategy
+# Barbell Portfolio (NEW — existing strategies above are untouched)
+from .barbell_strangle import BarbellStrangleStrategy
+from .weekly_momentum_buyer import WeeklyMomentumBuyerStrategy
 
 __all__ = [
     "BaseStrategy",
@@ -18,4 +21,7 @@ __all__ = [
     "ShortStrangleStrategy",
     "IronButterflyStrategy",
     "AdaptiveStrangleStrategy",
+    # Barbell
+    "BarbellStrangleStrategy",
+    "WeeklyMomentumBuyerStrategy",
 ]

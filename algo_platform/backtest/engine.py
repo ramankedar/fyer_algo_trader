@@ -378,7 +378,9 @@ class BacktestEngine:
             if hasattr(strategy, "should_exit"):
                 return strategy.should_exit(bar, features)
         elif strategy_name in ("GammaExpansion", "ShortStraddle", "ShortStrangle",
-                               "IronButterfly", "AdaptiveStrangle"):
+                               "IronButterfly", "AdaptiveStrangle",
+                               "BarbellStrangle",         # Barbell theta (NEW)
+                               "WeeklyMomentumBuyer"):    # Barbell convexity (NEW)
             if hasattr(strategy, "should_exit"):
                 return strategy.should_exit(bar, features, current_val)
         elif strategy_name == "WeeklyIronCondor":

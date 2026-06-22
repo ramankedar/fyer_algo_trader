@@ -162,6 +162,14 @@ class RiskConfig:
     max_open_trades:        int   = 4
     margin_reserve:         float = 25_000.0   # always keep ₹25K free (scaled to ₹2L capital)
 
+    # ── Barbell Portfolio Capital Sleeves (NEW — does not affect other strategies) ──
+    # The Barbell splits total capital into two specialised pools:
+    #   theta_capital    → ShortStrangle / BarbellStrangle (steady theta income)
+    #   convexity_capital → Option buyers: FixedRR / CompressionBreakout (convex payoff)
+    # Sum = capital (200_000). Adjust the split here; nothing else needs changing.
+    theta_capital:          float = 120_000.0  # ₹1.2L → strangle margin
+    convexity_capital:      float =  80_000.0  # ₹0.8L → directional option buyers
+
 
 @dataclass
 class BacktestConfig:
