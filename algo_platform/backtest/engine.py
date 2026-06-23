@@ -441,29 +441,41 @@ class BacktestEngine:
     ) -> float:
         """
         Compute the net per-unit exit value of the spread.
-        Uses chain mid-prices when available, else BS time-decay estimate.
+
+        For each leg: use the chain mid-price if a quote exists, otherwise fall
+        back to intrinsic value + decayed time value for that individual leg.
+
+        The old approach fell back to `net_debit * decay` whenever ANY leg was
+        missing a quote. This caused a catastrophic mismatch: deeply ITM options
+        (correctly priced in the chain) were ignored, while deeply OTM options
+        (dropped by the <₹0.10 chain filter) were priced as if they still had
+        half their entry premium. The net effect: large losses reported as profits.
         """
-        if chain is not None:
-            net = 0.0
-            found = 0
-            for leg in ot.signal.legs:
+        elapsed_hours  = max(0.0, (bar.timestamp - ot.entry_time).total_seconds() / 3600)
+        time_used_frac = min(1.0, elapsed_hours / 6.25)   # 6.25 h session
+        decay          = max(0.05, 1.0 - time_used_frac ** 0.5)
+
+        net = 0.0
+        for leg in ot.signal.legs:
+            sign = 1.0 if leg.side == OrderSide.BUY else -1.0
+
+            # Prefer chain mid-price
+            if chain is not None:
                 q = chain.quote(leg.strike, leg.option_type)
                 if q is not None:
-                    price = q.mid
-                    sign  = 1.0 if leg.side == OrderSide.BUY else -1.0
-                    net  += sign * price
-                    found += 1
-            if found == len(ot.signal.legs) and found > 0:
-                return float(net)
+                    net += sign * q.mid
+                    continue
 
-        # Fallback: time-decay estimate (assumes sqrt-time value decay)
-        from datetime import timedelta
-        elapsed_hours = max(0.0, (bar.timestamp - ot.entry_time).total_seconds() / 3600)
-        session_hours = 6.25   # 9:15 AM – 3:30 PM
-        time_used_frac = min(1.0, elapsed_hours / session_hours)
-        # Value decays from entry_debit towards intrinsic as time passes
-        decay = max(0.05, 1.0 - time_used_frac ** 0.5)
-        return float(ot.signal.net_debit * decay)
+            # Per-leg fallback: intrinsic + decayed time value.
+            # Intrinsic captures ITM value; time_val represents remaining extrinsic.
+            if leg.option_type == OptionType.CALL:
+                intrinsic = max(0.0, bar.close - leg.strike)
+            else:
+                intrinsic = max(0.0, leg.strike - bar.close)
+            time_val = leg.limit_price * decay
+            net += sign * (intrinsic + time_val)
+
+        return float(net)
 
 
 # ── Internal state ────────────────────────────────────────────────────────────
