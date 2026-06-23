@@ -126,7 +126,7 @@ class BarbellStrangleStrategy(BaseStrategy):
     ) -> Optional[Signal]:
         if not self._is_active or chain is None:
             return None
-        if not self._is_thursday(bar.timestamp):
+        if not self._is_expiry_day(bar.timestamp):
             return None
         if self._signal_today or self._in_trade:
             return None

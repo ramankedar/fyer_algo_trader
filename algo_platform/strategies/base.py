@@ -70,12 +70,16 @@ class BaseStrategy(ABC):
         t = ts.time()
         return _parse_hhmm(start) <= t <= _parse_hhmm(end)
 
-    def _is_thursday(self, ts: datetime) -> bool:
+    def _is_expiry_day(self, ts: datetime) -> bool:
         """True on this instrument's weekly expiry day (reads from config.LOT_SIZES)."""
         from algo_platform.core.config import LOT_SIZES
         spec = LOT_SIZES.get(self.instrument.value)
         wd   = spec.expiry_weekday if spec else 3   # default Thursday
         return ts.weekday() == wd
+
+    # Keep old name as a shim so existing code doesn't silently break during transition
+    def _is_thursday(self, ts: datetime) -> bool:
+        return self._is_expiry_day(ts)
 
     def _build_call_spread(
         self,

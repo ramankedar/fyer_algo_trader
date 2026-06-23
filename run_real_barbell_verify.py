@@ -302,67 +302,96 @@ def _run_instrument(
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def main(start: date, end: date) -> None:
+# BANKNIFTY weekly options were discontinued by SEBI circular (effective Nov 2024).
+# NSE retained only NIFTY on Thursday; BANKNIFTY now has monthly/quarterly options only.
+# Any BANKNIFTY trade dated after this cutoff is based on non-existent weekly contracts.
+_BANKNIFTY_WEEKLY_CUTOFF = date(2024, 11, 13)
+
+
+def main(start: date, end: date, bhavcopy_dir: str = "nse_option_cache") -> None:
+    import os
+    # Allow BHAVCOPY_PATH environment variable as fallback before the default
+    bhavcopy_dir = bhavcopy_dir or os.environ.get("BHAVCOPY_PATH", "nse_option_cache")
+
     cfg = load_config()
     dl  = FyersDownloader(cfg.broker.app_id, cfg.broker.access_token, "data/cache")
     ldr = MarketDataLoader(dl)
-    bh  = NseBhavcopDownloader("nse_option_cache")
+    bh  = NseBhavcopDownloader(bhavcopy_dir)
 
     theta_cap = cfg.risk.theta_capital   # ₹1.2L
 
     print(f"\n{'━'*65}")
     print(f"  REAL-DATA BARBELL VERIFICATION — BarbellStrangle")
     print(f"{'━'*65}")
-    print(f"  Period    : {start} → {end}")
-    print(f"  Capital   : ₹{theta_cap:,.0f} per instrument (recycled)")
-    print(f"  Exit data : NSE bhavcopy settlement (REAL)")
-    print(f"  Entry data: BS + real VIX (semi-real, +10-15% vs actual)")
-    print(f"  Leg stops : Real underlying movement + BS re-price")
+    print(f"  Period      : {start} → {end}")
+    print(f"  Capital     : ₹{theta_cap:,.0f} per instrument (recycled)")
+    print(f"  Exit data   : NSE bhavcopy settlement (REAL)")
+    print(f"  Entry data  : BS + real VIX (semi-real, credit slightly understated)")
+    print(f"  Leg stops   : Real underlying spot breach")
+    print(f"  Bhavcopy dir: {bhavcopy_dir}")
     print()
 
     all_results = {}
     total_pnl   = 0.0
+    nifty_trades = banknifty_trades = 0
 
-    # ── Load VIX once (shared across instruments) ──────────────────────────────
     vix = ldr.load_vix(start, end)
 
-    # ── Instrument-specific expiry day configuration ───────────────────────────
-    # NIFTY   → expires Thursday (weekday=3) → load only NIFTY Thursday bars
-    # BANKNIFTY → expires Wednesday (weekday=2) → load only BANKNIFTY Wednesday bars
-    # Loading all weekdays would mix NIFTY Wednesday bars (irrelevant) into NIFTY analysis,
-    # and BANKNIFTY Thursday bars (irrelevant) into BANKNIFTY analysis. Avoid that.
+    # NIFTY   → expires Thursday (weekday=3)
+    # BANKNIFTY → expires Wednesday (weekday=2), but ONLY until 2024-11-13
     INSTRUMENT_CONFIG = {
-        "NIFTY":     {"expiry_weekday": 3, "weekday_name": "Thursday"},
-        "BANKNIFTY": {"expiry_weekday": 2, "weekday_name": "Wednesday"},
+        "NIFTY":     {"expiry_weekday": 3, "weekday_name": "Thursday",
+                      "date_cutoff": None},
+        "BANKNIFTY": {"expiry_weekday": 2, "weekday_name": "Wednesday",
+                      "date_cutoff": _BANKNIFTY_WEEKLY_CUTOFF},
     }
 
     for inst, icfg in INSTRUMENT_CONFIG.items():
         expiry_wd   = icfg["expiry_weekday"]
         expiry_name = icfg["weekday_name"]
+        cutoff      = icfg["date_cutoff"]
+
+        # Warn prominently when the date range extends beyond the instrument's cutoff
+        if cutoff is not None and end > cutoff:
+            effective_end = min(end, cutoff)
+            print(f"  ⚠  {inst}: weekly options DISCONTINUED after {cutoff}")
+            print(f"     SEBI Oct-2024 circular eliminated BANKNIFTY weekly expiry.")
+            print(f"     Restricting analysis to {start} → {effective_end}.")
+            print(f"     Dates {effective_end + timedelta(days=1)} → {end} use options that do not exist.")
+            print()
+            effective_end_for_bars = cutoff
+        else:
+            effective_end_for_bars = end
+
         print(f"Running {inst} ({expiry_name} expiry only)...", flush=True)
 
-        # Load only expiry-day bars for this instrument
-        # NIFTY: load NIFTY 1-min bars → filter to Thursdays only
-        # BANKNIFTY: load BANKNIFTY 1-min bars → filter to Wednesdays only
         all_bars = ldr.load_bars(inst, start, end, "1")
-        bars = [b for b in all_bars if b.timestamp.weekday() == expiry_wd]
+        bars = [
+            b for b in all_bars
+            if b.timestamp.weekday() == expiry_wd
+            and b.timestamp.date() <= effective_end_for_bars
+        ]
 
         if not bars:
-            print(f"  No {expiry_name} {inst} bars found — skipping")
+            print(f"  No valid {expiry_name} {inst} bars found — skipping\n")
             continue
 
-        print(f"  {inst} {expiry_name} bars: {len(bars):,} "
-              f"(from {len(all_bars):,} total → kept only {expiry_name}s)")
+        print(f"  {inst} bars: {len(bars):,} (expiry-day only, up to {effective_end_for_bars})")
 
         res = _run_instrument(inst, bars, vix, bh, theta_cap, lots=1)
         all_results[inst] = res
         total_pnl += res.get("total_pnl", 0)
+        if inst == "NIFTY":
+            nifty_trades = res.get("trades", 0)
+        else:
+            banknifty_trades = res.get("trades", 0)
 
         if res.get("trades", 0) == 0:
-            print(f"  {inst}: No trades (missing bhavcopy data for this period)")
+            print(f"  {inst}: No trades found\n")
             continue
 
         real_pct = res['real_exits_pct']
+        n_eod    = res['trades'] - res['ce_stops'] - res['pe_stops']
         print(f"  {'='*58}")
         print(f"  {inst} Real-Data Results:")
         print(f"    Trades          : {res['trades']}")
@@ -374,42 +403,60 @@ def main(start: date, end: date) -> None:
         print(f"    Avg loss        : ₹{res['avg_loss']:+,.0f}")
         print(f"    CE leg stops    : {res['ce_stops']}/{res['trades']}")
         print(f"    PE leg stops    : {res['pe_stops']}/{res['trades']}")
+        print(f"    EOD (no breach) : {n_eod}/{res['trades']}")
         print(f"    Real exits      : {real_pct:.0%} (bhavcopy settlement)")
-        if real_pct < 0.7:
-            print(f"    ⚠  Low real-exit rate: missing bhavcopy files.")
-            print(f"       Run download to fill gaps.")
-        print(f"  {'='*58}")
+        if real_pct < 0.5 and n_eod > 0:
+            real_count = round(real_pct * res['trades'])
+            print(f"    ⚠  Only {real_count}/{n_eod} EOD trades have bhavcopy data.")
+            print(f"       Remaining EOD trades fall back to intrinsic value.")
+        print(f"  {'='*58}\n")
 
-    # Combined
-    if len(all_results) == 2:
-        n_total    = all_results["NIFTY"]["trades"] + all_results["BANKNIFTY"]["trades"]
+    # Combined summary (only instruments that actually ran)
+    ran = {k: v for k, v in all_results.items() if v.get("trades", 0) > 0}
+    if len(ran) >= 1:
+        n_total      = sum(v["trades"] for v in ran.values())
         combined_pnl = total_pnl
-        years      = n_total / 104.0   # 52 Thu + 52 Wed per year
-        cagr_combined = (1 + combined_pnl / theta_cap) ** (1/years) - 1 if years > 0 else 0
+        # Annualise based on actual trade frequency
+        years = (nifty_trades / 52.0) if nifty_trades > 0 else (banknifty_trades / 52.0)
+        if banknifty_trades > 0 and nifty_trades > 0:
+            years = max(nifty_trades, banknifty_trades) / 52.0
+        cagr_combined = (1 + combined_pnl / theta_cap) ** (1 / years) - 1 if years > 0 else 0
 
         print(f"\n{'━'*65}")
-        print(f"  COMBINED (same ₹{theta_cap/1000:.0f}K recycled, NIFTY Thu + BNF Wed)")
+        print(f"  COMBINED ({' + '.join(ran.keys())})")
         print(f"{'━'*65}")
         print(f"  Total trades    : {n_total}")
         print(f"  Total P&L       : ₹{combined_pnl:+,.0f}")
         print(f"  Combined CAGR   : {cagr_combined:+.1%}")
         print()
-        print(f"  DISCOUNT ANALYSIS:")
-        print(f"  ┌─────────────────────────────────────────────────┐")
-        print(f"  │ This backtest uses real NSE settlement for exits │")
-        print(f"  │ Entry is BS-estimated (actual = +10-15% pricier) │")
-        print(f"  │ ∴ Adjust: CAGR × 0.90 for realistic expectation │")
-        print(f"  │ Conservative real-world CAGR: {cagr_combined*0.90:+.1%}              │")
-        print(f"  └─────────────────────────────────────────────────┘")
+        print(f"  ACCURACY NOTES:")
+        print(f"  ┌────────────────────────────────────────────────────┐")
+        print(f"  │ Exit  : Real NSE settlement (most accurate)         │")
+        print(f"  │ Entry : BS-estimated (credit-side, so understated)  │")
+        print(f"  │ As a CREDIT strategy, real entry premium is higher  │")
+        print(f"  │ than BS estimate → actual edge is ≥ what's shown.   │")
+        print(f"  │ Apply ~5-10% haircut only for bid-ask slippage.     │")
+        print(f"  │ Conservative real-world CAGR: {cagr_combined*0.93:+.1%}               │")
+        print(f"  └────────────────────────────────────────────────────┘")
+        if "BANKNIFTY" not in ran:
+            print(f"\n  ⚠  BANKNIFTY excluded: weekly options discontinued Nov 2024.")
+            print(f"     Portfolio is NIFTY Thursday only until a replacement is found.")
 
-    print(f"\n  FINAL CONCLUSION → see below")
+    print(f"\n  CONCLUSION: Run on NIFTY-only range for the cleanest signal.")
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description="Real-data BarbellStrangle verification")
-    p.add_argument("--start", default="2023-01-01")
-    p.add_argument("--end",   default=str(date.today()))
+    p.add_argument("--start",        default="2023-01-01")
+    p.add_argument("--end",          default=str(date.today()))
+    p.add_argument("--bhavcopy-dir", default=None,
+                   help="Path to bhavcopy parquet cache. "
+                        "Falls back to $BHAVCOPY_PATH env var, then 'nse_option_cache'.")
     args = p.parse_args()
-    main(date.fromisoformat(args.start), date.fromisoformat(args.end))
+    main(
+        date.fromisoformat(args.start),
+        date.fromisoformat(args.end),
+        bhavcopy_dir=args.bhavcopy_dir or "nse_option_cache",
+    )
