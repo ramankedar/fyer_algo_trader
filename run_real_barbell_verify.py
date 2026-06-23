@@ -65,6 +65,10 @@ _INSTRUMENTS = {
     "BANKNIFTY": {"step": 100.0, "expiry_wd": 2, "nse_sym": "BANKNIFTY"},
 }
 
+# When spot touches a sold strike on 0DTE, IV typically spikes 25-35% above VIX.
+# 1.30x is a conservative estimate for the ATM IV expansion at breach.
+_IV_SPIKE_MULT = 1.30
+
 
 # ── BS pricer ─────────────────────────────────────────────────────────────────
 
@@ -110,8 +114,17 @@ def _simulate_trade(
     lot_size:    int,
     lots:        int,
 ) -> Optional[_TradeResult]:
-    """Run one BarbellStrangle trade using real data for exits."""
-    # Find 1:30 PM bar
+    """
+    Run one BarbellStrangle trade using real underlying data + NSE bhavcopy exits.
+
+    Stop logic matches the live BarbellStrangleStrategy:
+      - FULL POSITION exit when spot crosses EITHER sold strike (not per-leg BS stop).
+      - On breach: price exit using BS with IV expansion (_IV_SPIKE_MULT × VIX) because
+        the static prior-day VIX underestimates actual IV during an intraday spike.
+      - No breach: use real NSE bhavcopy settlement price (most accurate available data).
+        Fallback: pure intrinsic from EOD spot (conservative, no time value inflated).
+    """
+    # ── Entry: closest bar to 1:30 PM ─────────────────────────────────────────
     target_min = 13 * 60 + 30
     entry_bar  = min(
         (b for b in day_bars
@@ -127,108 +140,98 @@ def _simulate_trade(
     iv        = vix_val / 100.0
     tte_entry = _tte_years(entry_bar.timestamp)
 
-    # 0.30σ OTM offset (same as BarbellStrangle)
+    # 0.30σ OTM offset — identical to BarbellStrangleStrategy
     two_hr_move = spot * iv * math.sqrt(tte_entry)
     otm_off     = max(step, round(two_hr_move * 0.30 / step) * step)
     sc_strike   = round((atm + otm_off) / step) * step
     sp_strike   = round((atm - otm_off) / step) * step
 
-    # Entry prices: BS with real VIX
+    # Entry prices: BS with prior-day VIX (best proxy without intraday chain data)
     ce_entry = _bs(spot, sc_strike, tte_entry, iv, is_call=True)
     pe_entry = _bs(spot, sp_strike, tte_entry, iv, is_call=False)
-
     if ce_entry < 1.0 or pe_entry < 1.0:
-        return None   # too cheap → skip
+        return None
 
-    r = _TradeResult()
-    r.ce_entry    = ce_entry
-    r.pe_entry    = pe_entry
-    ce_stop_price = ce_entry * 1.30
-    pe_stop_price = pe_entry * 1.30
+    r          = _TradeResult()
+    r.ce_entry = ce_entry
+    r.pe_entry = pe_entry
 
-    # Intraday leg stop simulation using real underlying + BS
-    ce_stopped_price = pe_stopped_price = None
+    # ── Intraday spot-breach stop (full-position exit on first breach) ─────────
+    breach_bar = None
     for bar in day_bars:
-        ts = bar.timestamp
-        h, m = ts.hour, ts.minute
+        h, m = bar.timestamp.hour, bar.timestamp.minute
         if h < 13 or (h == 13 and m < 30):
             continue
         if h > 15 or (h == 15 and m > 15):
-            break   # past our exit time
-
-        tte = _tte_years(ts)
-        ce_now = _bs(bar.close, sc_strike, tte, iv, is_call=True)
-        pe_now = _bs(bar.close, sp_strike, tte, iv, is_call=False)
-
-        if ce_stopped_price is None and ce_now >= ce_stop_price:
-            ce_stopped_price = ce_now
-            r.ce_stopped = True
-
-        if pe_stopped_price is None and pe_now >= pe_stop_price:
-            pe_stopped_price = pe_now
-            r.pe_stopped = True
-
-        if r.ce_stopped and r.pe_stopped:
             break
 
-    # Exit prices
-    if bhavcopy is not None:
-        # Real settlement prices from NSE bhavcopy
-        nse_sym = _INSTRUMENTS[instrument]["nse_sym"]
-        sub = bhavcopy[
-            (bhavcopy["underlying"] == nse_sym) &
-            (bhavcopy["expiry"] == expiry_date)
-        ]
+        if bar.close >= sc_strike:
+            breach_bar   = bar
+            r.ce_stopped = True
+            break
+        if bar.close <= sp_strike:
+            breach_bar   = bar
+            r.pe_stopped = True
+            break
 
-        def _settle(strike, opt_type):
-            # Fuzzy strike match to handle float precision issues
-            row = sub[
-                (abs(sub["strike"] - strike) < 0.5) &
-                (sub["option_type"] == opt_type)
-            ]
-            if row.empty:
-                return None
+    if breach_bar is not None:
+        # Price the full position at the breach bar.
+        # The breached leg is now ATM; apply IV spike multiplier because
+        # the prior-day VIX understates actual IV during an intraday move.
+        # The surviving leg uses static VIX (it's still OTM, less IV expansion).
+        tte_b  = _tte_years(breach_bar.timestamp)
+        ce_iv  = iv * (_IV_SPIKE_MULT if r.ce_stopped else 1.0)
+        pe_iv  = iv * (_IV_SPIKE_MULT if r.pe_stopped else 1.0)
+        r.ce_exit     = _bs(breach_bar.close, sc_strike, tte_b, ce_iv, is_call=True)
+        r.pe_exit     = _bs(breach_bar.close, sp_strike, tte_b, pe_iv, is_call=False)
+        r.exit_reason = "spot_breach_stop"
 
-            settle_val = float(row["settlement"].iloc[0])
-
-            # Old NSE bhavcopy format (pre-2024) stores the UNDERLYING settlement
-            # in the SETTLE_PR column, not the option settlement. Detect this case:
-            # if all settlement values in the sub-df are equal (= underlying level),
-            # then compute option intrinsic from that underlying level.
-            if sub["settlement"].std() < 1.0 and settle_val > 1000:
-                # Old format: settle_val is the underlying index level
-                underlying_lvl = settle_val
-                if opt_type == "CE":
-                    return max(0.0, underlying_lvl - strike)
-                else:
-                    return max(0.0, strike - underlying_lvl)
-
-            # New format: settle_val is the actual option premium settlement
-            return settle_val if settle_val >= 0 else float(row["close"].iloc[0])
-
-        ce_settle = _settle(sc_strike, "CE")
-        pe_settle = _settle(sp_strike, "PE")
     else:
+        # ── EOD exit: use real NSE bhavcopy settlement ─────────────────────────
         ce_settle = pe_settle = None
+        if bhavcopy is not None:
+            nse_sym = _INSTRUMENTS[instrument]["nse_sym"]
+            sub = bhavcopy[
+                (bhavcopy["underlying"] == nse_sym) &
+                (bhavcopy["expiry"] == expiry_date)
+            ]
 
-    # Use real settlement for non-stopped legs
-    r.ce_exit = ce_stopped_price if r.ce_stopped else (ce_settle if ce_settle is not None
-                 else _bs(day_bars[-1].close, sc_strike, 1e-6, iv, is_call=True))
-    r.pe_exit = pe_stopped_price if r.pe_stopped else (pe_settle if pe_settle is not None
-                 else _bs(day_bars[-1].close, sp_strike, 1e-6, iv, is_call=False))
+            def _settle(strike: float, opt_type: str) -> Optional[float]:
+                row = sub[
+                    (abs(sub["strike"] - strike) < 0.5) &
+                    (sub["option_type"] == opt_type)
+                ]
+                if row.empty:
+                    return None
+                settle_val = float(row["settlement"].iloc[0])
+                # Old NSE bhavcopy format (pre-2024): settlement column stores the
+                # UNDERLYING level (same value for all rows). Detect and convert to
+                # option intrinsic.
+                if sub["settlement"].std() < 1.0 and settle_val > 1000:
+                    underlying_lvl = settle_val
+                    return max(0.0, underlying_lvl - strike) if opt_type == "CE" \
+                           else max(0.0, strike - underlying_lvl)
+                # New format: settlement is the actual option settlement premium
+                return settle_val if settle_val >= 0 else float(row["close"].iloc[0])
 
-    # PnL: collected (ce_entry + pe_entry), paid (ce_exit + pe_exit) + tx costs
+            ce_settle = _settle(sc_strike, "CE")
+            pe_settle = _settle(sp_strike, "PE")
+
+        # Fallback: pure intrinsic from EOD spot (conservative — no inflated time value)
+        eod_spot  = day_bars[-1].close if day_bars else spot
+        r.ce_exit = ce_settle if ce_settle is not None else max(0.0, eod_spot - sc_strike)
+        r.pe_exit = pe_settle if pe_settle is not None else max(0.0, sp_strike - eod_spot)
+
+        ce_src = "bhavcopy✓" if ce_settle is not None else "intrinsic~"
+        pe_src = "bhavcopy✓" if pe_settle is not None else "intrinsic~"
+        r.exit_reason = f"CE:{ce_src} PE:{pe_src}"
+
+    # ── PnL ───────────────────────────────────────────────────────────────────
     credit_collected = (ce_entry + pe_entry) * lots * lot_size
     exit_cost_paid   = (r.ce_exit + r.pe_exit) * lots * lot_size
-    tx_costs         = 20 * 4 + 0.0625e-2 * exit_cost_paid + 0.18 * (80 + 5)  # approx ₹300
+    tx_costs         = 20 * 4 + 0.0625e-2 * exit_cost_paid + 0.18 * (80 + 5)
     r.pnl = credit_collected - exit_cost_paid - tx_costs
-
     r.win = r.pnl > 0
-    ce_src = "bhavcopy✓" if (ce_settle is not None and not r.ce_stopped) else \
-             ("leg_stop" if r.ce_stopped else "BS~")
-    pe_src = "bhavcopy✓" if (pe_settle is not None and not r.pe_stopped) else \
-             ("leg_stop" if r.pe_stopped else "BS~")
-    r.exit_reason = f"CE:{ce_src} PE:{pe_src}"
     return r
 
 
