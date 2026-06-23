@@ -7,9 +7,11 @@ from .iron_condor import IronCondorStrategy
 from .short_strangle import ShortStrangleStrategy
 from .iron_butterfly import IronButterflyStrategy
 from .adaptive_strangle import AdaptiveStrangleStrategy
-# Barbell Portfolio (NEW — existing strategies above are untouched)
+# Barbell Portfolio (existing strategies above are untouched)
 from .barbell_strangle import BarbellStrangleStrategy
 from .weekly_momentum_buyer import WeeklyMomentumBuyerStrategy
+# Experimental — research framework, not production-ready
+from .production_theta import ProductionThetaStrategy
 
 __all__ = [
     "BaseStrategy",
@@ -24,4 +26,6 @@ __all__ = [
     # Barbell
     "BarbellStrangleStrategy",
     "WeeklyMomentumBuyerStrategy",
+    # Experimental
+    "ProductionThetaStrategy",
 ]

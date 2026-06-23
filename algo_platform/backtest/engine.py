@@ -162,7 +162,7 @@ class BacktestEngine:
             for ot in open_trades:
                 exit_signal, exit_reason = self._check_exit(ot, bar, features, strategy, chain)
                 if exit_signal:
-                    trade = self._close_trade(ot, bar, exit_reason, chain)
+                    trade = self._close_trade(ot, bar, exit_reason, chain, strategy)
                     # nav impact = exit_proceeds - exit_costs (entry cost already
                     # deducted at open via nav -= ot.cost, so don't deduct again)
                     nav  += trade.pnl + ot.cost
@@ -204,7 +204,8 @@ class BacktestEngine:
         if bars and open_trades:
             last_bar = bars[-1]
             for ot in open_trades:
-                trade = self._close_trade(ot, last_bar, "end_of_simulation")
+                trade = self._close_trade(ot, last_bar, "end_of_simulation",
+                                          strategy=strategy)
                 nav  += trade.pnl
                 trades.append(trade)
             daily_nav[last_bar.timestamp.date()] = nav
@@ -379,8 +380,9 @@ class BacktestEngine:
                 return strategy.should_exit(bar, features)
         elif strategy_name in ("GammaExpansion", "ShortStraddle", "ShortStrangle",
                                "IronButterfly", "AdaptiveStrangle",
-                               "BarbellStrangle",         # Barbell theta (NEW)
-                               "WeeklyMomentumBuyer"):    # Barbell convexity (NEW)
+                               "BarbellStrangle",         # Barbell theta
+                               "WeeklyMomentumBuyer",     # Barbell convexity
+                               "ProductionTheta"):        # Experimental CatE
             if hasattr(strategy, "should_exit"):
                 return strategy.should_exit(bar, features, current_val)
         elif strategy_name == "WeeklyIronCondor":
@@ -398,12 +400,21 @@ class BacktestEngine:
     def _close_trade(
         self, ot: "OpenTrade", bar: MarketBar, reason: str,
         chain: Optional["OptionChain"] = None,
+        strategy: Optional[BaseStrategy] = None,
     ) -> Trade:
         """
         Mark trade closed; PnL uses current chain's BS mid-prices for each leg.
         Falls back to time-value-decay estimate when chain is unavailable.
+
+        If the strategy implements compute_exit_value(), that method is used instead
+        of the default _spread_exit_value(). This allows strategies with independent
+        leg management (e.g. ProductionThetaStrategy) to blend recorded stop prices
+        for individually-closed legs with current chain prices for surviving legs.
         """
-        exit_net_per_unit = self._spread_exit_value(ot, bar, chain)
+        if strategy is not None and hasattr(strategy, "compute_exit_value"):
+            exit_net_per_unit = strategy.compute_exit_value(ot, bar, chain)
+        else:
+            exit_net_per_unit = self._spread_exit_value(ot, bar, chain)
 
         # Net proceeds = exit spread value × lots × lot_size
         exit_proceeds = exit_net_per_unit * ot.lots * ot.lot_size
