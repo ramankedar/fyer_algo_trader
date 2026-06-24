@@ -378,11 +378,15 @@ class BacktestEngine:
         elif strategy_name == "IntradayTrend":
             if hasattr(strategy, "should_exit"):
                 return strategy.should_exit(bar, features)
+        elif strategy_name == "ProductionTheta":
+            # ProductionThetaStrategy accepts an optional chain arg so its
+            # catastrophic stop can use real ask prices instead of BS estimates.
+            if hasattr(strategy, "should_exit"):
+                return strategy.should_exit(bar, features, current_val, chain)
         elif strategy_name in ("GammaExpansion", "ShortStraddle", "ShortStrangle",
                                "IronButterfly", "AdaptiveStrangle",
                                "BarbellStrangle",         # Barbell theta
-                               "WeeklyMomentumBuyer",     # Barbell convexity
-                               "ProductionTheta"):        # Experimental CatE
+                               "WeeklyMomentumBuyer"):    # Barbell convexity
             if hasattr(strategy, "should_exit"):
                 return strategy.should_exit(bar, features, current_val)
         elif strategy_name == "WeeklyIronCondor":

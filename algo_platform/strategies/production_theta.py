@@ -66,9 +66,17 @@ def _bs(S: float, K: float, T: float, sigma: float,
 
 
 def _remaining_tte(ts: datetime) -> float:
-    """Trading minutes remaining to 15:30, expressed as fraction of a trading year."""
+    """
+    Calendar minutes remaining to 15:30, expressed as fraction of a 365-day calendar year.
+
+    Uses 365 × 24 × 60 = 525,600 calendar minutes so T is consistent with how
+    India VIX is annualised (calendar days, not trading days).  Using the old
+    trading-days denominator (60 × 6.25 × 252 = 94,500) inflated T by 5.6×,
+    causing the Black-Scholes catastrophic-stop estimate to drift well above the
+    4× threshold within minutes of entry and trigger phantom losses.
+    """
     mins = max(1, (_CLOSE_HOUR * 60 + _CLOSE_MINUTE) - (ts.hour * 60 + ts.minute))
-    return mins / (60 * _TRADING_HOURS * _TRADING_DAYS)
+    return mins / (365 * 24 * 60)   # 525,600 calendar minutes per year
 
 
 # ── Strategy ──────────────────────────────────────────────────────────────────
@@ -340,30 +348,40 @@ class ProductionThetaStrategy(BaseStrategy):
         bar:           MarketBar,
         features:      FeatureVector,
         current_value: float,
+        chain:         Optional[OptionChain] = None,
     ) -> tuple[bool, str]:
         """
         Independent leg management with buffer and catastrophic stops.
 
         Stop priority (checked in order):
           1. EOD time stop — hard wall, always fires
-          2. Catastrophic stop — BS-estimated option value ≥ entry × cat_premium_mult
-          3. Buffer stop — spot beyond sold_strike ± buffer (spot-based, no BS)
+          2. Catastrophic stop — option ask price ≥ entry × cat_premium_mult.
+             Uses live chain.ask when available (preferred — immune to TTE/IV model
+             errors). Falls back to BS with entry IV (no cat_iv_mult) when chain
+             is absent.
+          3. Buffer stop — spot beyond sold_strike ± buffer (spot-based, no BS).
 
         When one leg triggers but the other is still open:
-          - Records the stop price for the breached leg
-          - Returns (False, "") so the surviving leg continues accumulating theta
-          - The engine keeps the trade open; compute_exit_value will blend the two
-            leg values correctly when the trade is eventually closed
+          - Records the stop price for the breached leg.
+          - Returns (False, "") so the surviving leg continues accumulating theta.
+          - The engine keeps the trade open; compute_exit_value blends the two leg
+            values correctly when the trade is eventually closed.
 
         Returns (True, reason) only when:
-          - Both legs have been independently stopped
-          - The EOD time stop fires
-          - A catastrophic stop fires (either leg, immediately closes full position)
+          - Both legs have been independently stopped (from buffer stops).
+          - The EOD time stop fires.
+          - A catastrophic stop fires (closes full position immediately).
+
+        Note — cat_iv_mult:
+          This parameter is intentionally NOT used in the BS catastrophic fallback.
+          The chain ask already reflects live IV; when the chain is absent, using
+          entry IV gives a conservative (harder-to-trigger) estimate that avoids
+          phantom stops. cat_iv_mult is reserved for future live-slippage modelling.
 
         Note for live trading:
-          _ce_stopped / _pe_stopped flags and _ce_stop_price / _pe_stop_price
-          must be read by the execution layer to place actual partial-close orders.
-          The backtest engine approximates this via compute_exit_value.
+          _ce_stopped / _pe_stopped and _ce_stop_price / _pe_stop_price must be
+          read by the execution layer to place partial-close orders. The backtest
+          engine approximates independent-leg P&L via compute_exit_value.
         """
         if not self._in_trade:
             return False, ""
@@ -374,78 +392,97 @@ class ProductionThetaStrategy(BaseStrategy):
             return True, "time_stop"
 
         spot = bar.close
-        tte  = _remaining_tte(bar.timestamp)
-        cat_iv = self._entry_iv * self._cat_iv_mult
+        tte  = _remaining_tte(bar.timestamp)   # calendar-time TTE (fixed)
 
-        # ── 2. Catastrophic stop (BS-based) ───────────────────────────────────
-        # Close the ENTIRE position immediately if either leg explodes past
-        # the catastrophic threshold. This is a full-position exit, not per-leg,
-        # because a large move invalidates the entire strangle rationale.
+        # ── Helper: get current option ask via chain or BS fallback ───────────
+        def _option_ask(strike: float, is_call: bool) -> float:
+            if chain is not None:
+                opt_type = OptionType.CALL if is_call else OptionType.PUT
+                q = chain.quote(strike, opt_type)
+                if q is not None:
+                    return q.ask   # real market ask — preferred
+            # Fallback: BS with entry IV only (no IV multiplier; avoids phantom stops)
+            return _bs(spot, strike, tte, self._entry_iv, self._rfr, is_call)
+
+        # ── 2. Catastrophic stop ──────────────────────────────────────────────
+        # Full-position exit when either leg has genuinely spiked past 4× entry.
+        # Using chain.ask removes TTE/IV-model sensitivity from the trigger.
         if not self._ce_stopped and self._ce_entry_price > 0:
-            ce_est = _bs(spot, self._sc_strike, tte, cat_iv, self._rfr, True)
-            if ce_est >= self._ce_entry_price * self._cat_premium_mult:
-                # Estimate exit price for the surviving PE leg at this moment too
-                pe_est = _bs(spot, self._sp_strike, tte, self._entry_iv, self._rfr, False)
-                self._ce_stop_price = ce_est
-                self._pe_stop_price = pe_est   # close PE simultaneously
+            ce_now = _option_ask(self._sc_strike, True)
+            if ce_now >= self._ce_entry_price * self._cat_premium_mult:
+                pe_now = _option_ask(self._sp_strike, False)
+                self._ce_stop_price = ce_now
+                self._pe_stop_price = pe_now
                 self._ce_stopped    = True
                 self._pe_stopped    = True
                 self._in_trade      = False
+                src = "chain" if chain is not None else "BS"
                 logger.warning(
-                    "ProductionTheta CATASTROPHIC STOP (CE) | SC=%.0f | spot=%.0f | "
-                    "ce_est=%.2f (%.1f× entry=%.2f) | cat_mult=%.1f",
-                    self._sc_strike, spot, ce_est,
-                    ce_est / max(self._ce_entry_price, 0.01),
+                    "ProductionTheta CATASTROPHIC STOP (CE) [%s] | SC=%.0f | spot=%.0f | "
+                    "ce_ask=%.2f (%.1f× entry=%.2f) | cat_mult=%.1f",
+                    src, self._sc_strike, spot, ce_now,
+                    ce_now / max(self._ce_entry_price, 0.01),
                     self._ce_entry_price, self._cat_premium_mult,
                 )
                 return True, "cat_stop_ce"
 
         if not self._pe_stopped and self._pe_entry_price > 0:
-            pe_est = _bs(spot, self._sp_strike, tte, cat_iv, self._rfr, False)
-            if pe_est >= self._pe_entry_price * self._cat_premium_mult:
-                ce_est = _bs(spot, self._sc_strike, tte, self._entry_iv, self._rfr, True)
-                self._pe_stop_price = pe_est
-                self._ce_stop_price = ce_est
-                self._ce_stopped    = True
+            pe_now = _option_ask(self._sp_strike, False)
+            if pe_now >= self._pe_entry_price * self._cat_premium_mult:
+                ce_now = _option_ask(self._sc_strike, True)
+                self._pe_stop_price = pe_now
+                self._ce_stop_price = ce_now
                 self._pe_stopped    = True
+                self._ce_stopped    = True
                 self._in_trade      = False
+                src = "chain" if chain is not None else "BS"
                 logger.warning(
-                    "ProductionTheta CATASTROPHIC STOP (PE) | SP=%.0f | spot=%.0f | "
-                    "pe_est=%.2f (%.1f× entry=%.2f) | cat_mult=%.1f",
-                    self._sp_strike, spot, pe_est,
-                    pe_est / max(self._pe_entry_price, 0.01),
+                    "ProductionTheta CATASTROPHIC STOP (PE) [%s] | SP=%.0f | spot=%.0f | "
+                    "pe_ask=%.2f (%.1f× entry=%.2f) | cat_mult=%.1f",
+                    src, self._sp_strike, spot, pe_now,
+                    pe_now / max(self._pe_entry_price, 0.01),
                     self._pe_entry_price, self._cat_premium_mult,
                 )
                 return True, "cat_stop_pe"
 
         # ── 3. Buffer stop (spot-based, per-leg) ──────────────────────────────
         # Closes only the breached leg; the surviving leg continues.
-        # The IV expansion (buffer_iv_mult) is applied when recording the stop price
-        # to approximate the real cost of closing at that moment.
+        # The exit price estimate uses chain ask (preferred) or BS with buffer_iv_mult
+        # (to model the IV expansion that typically accompanies an intraday spot move).
         if not self._ce_stopped and self._sc_strike > 0:
             if spot >= self._sc_strike + self._buffer:
-                ce_exit = _bs(spot, self._sc_strike, tte,
-                              self._entry_iv * self._buffer_iv_mult, self._rfr, True)
+                if chain is not None:
+                    q = chain.quote(self._sc_strike, OptionType.CALL)
+                    ce_exit = q.ask if q is not None else _bs(
+                        spot, self._sc_strike, tte,
+                        self._entry_iv * self._buffer_iv_mult, self._rfr, True)
+                else:
+                    ce_exit = _bs(spot, self._sc_strike, tte,
+                                  self._entry_iv * self._buffer_iv_mult, self._rfr, True)
                 self._ce_stop_price = ce_exit
                 self._ce_stopped    = True
                 logger.info(
                     "ProductionTheta CE BUFFER STOP | SC=%.0f | spot=%.0f | "
-                    "trigger=%.0f | ce_exit_est=%.2f | PE still open",
-                    self._sc_strike, spot,
-                    self._sc_strike + self._buffer, ce_exit,
+                    "trigger=%.0f | ce_exit=%.2f | PE still open",
+                    self._sc_strike, spot, self._sc_strike + self._buffer, ce_exit,
                 )
 
         if not self._pe_stopped and self._sp_strike > 0:
             if spot <= self._sp_strike - self._buffer:
-                pe_exit = _bs(spot, self._sp_strike, tte,
-                              self._entry_iv * self._buffer_iv_mult, self._rfr, False)
+                if chain is not None:
+                    q = chain.quote(self._sp_strike, OptionType.PUT)
+                    pe_exit = q.ask if q is not None else _bs(
+                        spot, self._sp_strike, tte,
+                        self._entry_iv * self._buffer_iv_mult, self._rfr, False)
+                else:
+                    pe_exit = _bs(spot, self._sp_strike, tte,
+                                  self._entry_iv * self._buffer_iv_mult, self._rfr, False)
                 self._pe_stop_price = pe_exit
                 self._pe_stopped    = True
                 logger.info(
                     "ProductionTheta PE BUFFER STOP | SP=%.0f | spot=%.0f | "
-                    "trigger=%.0f | pe_exit_est=%.2f | CE still open",
-                    self._sp_strike, spot,
-                    self._sp_strike - self._buffer, pe_exit,
+                    "trigger=%.0f | pe_exit=%.2f | CE still open",
+                    self._sp_strike, spot, self._sp_strike - self._buffer, pe_exit,
                 )
 
         # Both legs independently stopped → exit full position
@@ -453,7 +490,6 @@ class ProductionThetaStrategy(BaseStrategy):
             self._in_trade = False
             return True, "both_legs_stopped"
 
-        # One or zero legs stopped — keep position open for surviving leg
         return False, ""
 
     # ── Engine integration hook ────────────────────────────────────────────────
