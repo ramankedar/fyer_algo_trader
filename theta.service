@@ -1,0 +1,33 @@
+[Unit]
+Description=ProductionTheta Strategy Runner
+Documentation=https://github.com/ramankedar/algo_trader
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/algo_trader
+
+# Load credentials from .env
+EnvironmentFile=/home/ubuntu/algo_trader/.env
+
+# Start in PAPER mode by default.
+# Change to: python3 run_live_theta.py --live   ONLY after paper validation.
+ExecStart=/home/ubuntu/algo_trader/.venv/bin/python3 /home/ubuntu/algo_trader/run_live_theta.py
+
+# Restart only on failure (not on clean exit — strategy exits after market close)
+Restart=on-failure
+RestartSec=120
+
+# Log rotation — systemd captures stdout/stderr
+StandardOutput=append:/home/ubuntu/algo_trader/logs/service.log
+StandardError=append:/home/ubuntu/algo_trader/logs/service.log
+
+# Resource limits (this is NOT HFT — minimal CPU/RAM required)
+MemoryMax=512M
+CPUQuota=25%
+
+[Install]
+WantedBy=multi-user.target
