@@ -202,7 +202,7 @@ def run_synthetic(instrument: str, inst_enum: Instrument, start: date, end: date
         "n":    report.total_trades,
         "wr":   report.win_rate,
         "exp":  report.expectancy,
-        "pnl":  report.total_pnl,
+        "pnl":  report.final_capital - THETA,
         "cagr": report.cagr,
     }
 

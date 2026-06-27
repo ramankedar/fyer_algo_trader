@@ -27,14 +27,41 @@ import pandas as pd
 logger = logging.getLogger("algo_platform.data.downloader")
 
 FYERS_SYMBOLS: Dict[str, str] = {
-    # NSE
+    # NSE broad indices
     "NIFTY":     "NSE:NIFTY50-INDEX",
     "BANKNIFTY": "NSE:NIFTYBANK-INDEX",
     "FINNIFTY":  "NSE:FINNIFTY-INDEX",
-    # BSE
+    "NIFTY100":  "NSE:NIFTY100-INDEX",
+    "NIFTYMID":  "NSE:NIFTYMIDCAP50-INDEX",
+    # BSE indices
     "SENSEX":    "BSE:SENSEX-INDEX",
     "BANKEX":    "BSE:BANKEX-INDEX",
-    "BSEIT":     "BSE:IT-INDEX",         # BSE IT index (Focused IT / BSE Tech)
+    "BSEIT":     "BSE:IT-INDEX",
+    # NSE Sector indices (Tier 2 — sector momentum strategy)
+    "NIFTYIT":      "NSE:NIFTYIT-INDEX",
+    "NIFTYAUTO":    "NSE:NIFTYAUTO-INDEX",
+    "NIFTYMETAL":   "NSE:NIFTYMETAL-INDEX",
+    "NIFTYPHARMA":  "NSE:NIFTYPHARMA-INDEX",
+    "NIFTYFMCG":    "NSE:NIFTYFMCG-INDEX",
+    "NIFTYENERGY":  "NSE:NIFTYENERGY-INDEX",
+    "NIFTYREALTY":  "NSE:NIFTYREALTY-INDEX",
+    "NIFTYINFRA":   "NSE:NIFTYINFRA-INDEX",
+    "NIFTYMEDIA":   "NSE:NIFTYMEDIA-INDEX",
+    "NIFTYPS":      "NSE:NIFTYPSE-INDEX",      # public sector enterprises
+    # MCX Commodities — near-month contracts with cont_flag=1 for continuous history.
+    # Fyers requires the SPECIFIC contract symbol (MCX:GOLD26AUGFUT), not a generic "-I" form.
+    # Run refresh_mcx_symbols() to auto-update these from the Fyers symbol master each month.
+    # Last refreshed: 2026-06-26
+    "GOLD":         "MCX:GOLD26AUGFUT",
+    "GOLDMINI":     "MCX:GOLDM26AUGFUT",
+    "SILVER":       "MCX:SILVER26JULFUT",
+    "CRUDEOIL":     "MCX:CRUDEOIL26JULFUT",
+    "NATURALGAS":   "MCX:NATURALGAS26JULFUT",
+    "COPPER":       "MCX:COPPER26JULFUT",
+    "ZINC":         "MCX:ZINC26JULFUT",
+    "ALUMINIUM":    "MCX:ALUMINIUM26JULFUT",
+    "NICKEL":       "MCX:NICKEL26JULFUT",
+    "LEAD":         "MCX:LEAD26JULFUT",
     # Volatility
     "VIX":       "NSE:INDIAVIX-INDEX",
 }
@@ -227,3 +254,73 @@ class FyersDownloader:
             raise ImportError(
                 "fyers-apiv3 not installed. Run: pip install fyers-apiv3"
             )
+
+
+def refresh_mcx_symbols(update_module: bool = True) -> Dict[str, str]:
+    """
+    Auto-detect current near-month MCX symbols from Fyers public symbol master.
+
+    Call this once per month (or add to download_mcx.py startup) to keep
+    FYERS_SYMBOLS up to date as contracts expire and roll to next month.
+
+    Parameters
+    ----------
+    update_module : bool
+        If True (default), updates FYERS_SYMBOLS in this module in-place
+        so subsequent download() calls use the refreshed symbols.
+
+    Returns
+    -------
+    Dict[str, str]
+        {commodity_key: fyers_symbol} mapping of near-month contracts.
+    """
+    import requests
+
+    MCX_WANT = {
+        "GOLD":       lambda n: "GOLD" == n.split()[0] and "MINI" not in n and "GUINEA" not in n and "PETAL" not in n,
+        "GOLDMINI":   lambda n: n.startswith("GOLDM "),
+        "SILVER":     lambda n: "SILVER" == n.split()[0] and "MICRO" not in n and "MINI" not in n,
+        "CRUDEOIL":   lambda n: "CRUDEOIL" == n.split()[0] and "MINI" not in n,
+        "NATURALGAS": lambda n: "NATURALGAS" == n.split()[0] and "MINI" not in n,
+        "COPPER":     lambda n: "COPPER" == n.split()[0] and "MINI" not in n,
+        "ZINC":       lambda n: "ZINC" == n.split()[0] and "MINI" not in n,
+        "ALUMINIUM":  lambda n: "ALUMINIUM" == n.split()[0] and "MINI" not in n,
+        "NICKEL":     lambda n: "NICKEL" == n.split()[0] and "MINI" not in n,
+        "LEAD":       lambda n: "LEAD" == n.split()[0] and "MINI" not in n,
+    }
+
+    try:
+        resp = requests.get(
+            "https://public.fyers.in/sym_details/MCX_COM.csv",
+            timeout=20,
+        )
+        resp.raise_for_status()
+    except Exception as exc:
+        logger.warning("MCX symbol refresh failed: %s — using existing symbols", exc)
+        return {}
+
+    contracts: Dict[str, list] = {k: [] for k in MCX_WANT}
+    for line in resp.text.strip().split("\n"):
+        parts = line.split(",")
+        if len(parts) < 10:
+            continue
+        sym  = parts[9]
+        name = parts[1].strip().upper()
+        if not sym.startswith("MCX:") or "FUT" not in sym:
+            continue
+        for key, matcher in MCX_WANT.items():
+            if matcher(name):
+                contracts[key].append(sym)
+                break
+
+    result: Dict[str, str] = {}
+    for key, syms in contracts.items():
+        if syms:
+            result[key] = syms[0]   # first = nearest expiry
+            logger.info("MCX near-month: %-12s → %s", key, syms[0])
+
+    if update_module and result:
+        FYERS_SYMBOLS.update(result)
+        logger.info("FYERS_SYMBOLS updated with %d MCX near-month contracts", len(result))
+
+    return result

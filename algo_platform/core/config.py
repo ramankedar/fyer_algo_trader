@@ -27,7 +27,7 @@ class InstrumentSpec:
 # To change SENSEX expiry day (e.g., from Thu to Fri), edit this one line.
 LOT_SIZES: Dict[str, InstrumentSpec] = {
     # NSE indices
-    "NIFTY":     InstrumentSpec("NIFTY",     75, 0.05, 3),  # Thursday
+    "NIFTY":     InstrumentSpec("NIFTY",     75, 0.05, 1),  # Tuesday (NSE moved from Thu post-2024)
     "BANKNIFTY": InstrumentSpec("BANKNIFTY", 30, 0.05, 2),  # Wednesday
     "FINNIFTY":  InstrumentSpec("FINNIFTY",  40, 0.05, 1),  # Tuesday
     # BSE indices

@@ -66,19 +66,42 @@ from algo_platform.strategies import ProductionThetaStrategy
 load_dotenv(override=True)
 IST = ZoneInfo("Asia/Kolkata")
 
-# ── Strategy parameters ───────────────────────────────────────────────────────
-STRATEGIES = {
-    "A_base":   dict(entry_time="13:15", entry_end_time="13:25",
-                     buffer_mult=0.50, cat_premium_mult=4.0),
-    "B_tight":  dict(entry_time="13:15", entry_end_time="13:25",
-                     buffer_mult=0.40, cat_premium_mult=3.0),
+# ── Instrument config (expiry day, Fyers symbols, lot size) ──────────────────
+INSTRUMENT_CFG = {
+    "NIFTY": dict(
+        expiry_weekday = 1,                            # Tuesday
+        spot_symbol    = "NSE:NIFTY50-INDEX",
+        bar_symbol     = "NSE:NIFTY50-INDEX",
+        fyers_prefix   = "NSE:NIFTY",
+        lot_size       = LOT_SIZES["NIFTY"].lot_size,  # 75
+        step           = 50.0,
+    ),
+    "SENSEX": dict(
+        expiry_weekday = 3,                            # Thursday
+        spot_symbol    = "BSE:SENSEX",
+        bar_symbol     = "BSE:SENSEX",
+        fyers_prefix   = "BSE:SENSEX",
+        lot_size       = LOT_SIZES["SENSEX"].lot_size, # 10 — verify current BSE lot size
+        step           = 100.0,
+    ),
 }
-INSTRUMENT   = "NIFTY"
-LOT_SIZE     = LOT_SIZES[INSTRUMENT].lot_size       # 75
-LOTS         = 1
+
+# ── Strategies — 2 per instrument, 4 total ────────────────────────────────────
+STRATEGIES = {
+    "NIFTY_A":   dict(instrument="NIFTY",  entry_time="13:15", entry_end_time="13:25",
+                      buffer_mult=0.50, cat_premium_mult=4.0),
+    "NIFTY_B":   dict(instrument="NIFTY",  entry_time="13:15", entry_end_time="13:25",
+                      buffer_mult=0.40, cat_premium_mult=3.0),
+    "SENSEX_A":  dict(instrument="SENSEX", entry_time="13:15", entry_end_time="13:25",
+                      buffer_mult=0.50, cat_premium_mult=4.0),
+    "SENSEX_B":  dict(instrument="SENSEX", entry_time="13:15", entry_end_time="13:25",
+                      buffer_mult=0.40, cat_premium_mult=3.0),
+}
+
+LOTS          = 1
 THETA_CAPITAL = 120_000.0
-POLL_SECS    = 30    # check every 30 seconds (NOT HFT — this is a weekly strategy)
-SQUARE_OFF   = "15:15"
+POLL_SECS     = 30
+SQUARE_OFF    = "15:15"
 
 # ── Fyers endpoints and credentials ──────────────────────────────────────────
 DATA_URL     = "https://api-t1.fyers.in/data"
@@ -278,32 +301,46 @@ async def _fyers_get(client: httpx.AsyncClient, endpoint: str,
         d = r.json()
         if d.get("s") == "ok":
             return d
+        # 401 = token expired — try to re-auth once and retry
+        if r.status_code == 401 or "token" in str(d.get("message", "")).lower():
+            logging.warning("Fyers 401 on %s — re-authenticating...", endpoint)
+            new_tok = await ensure_valid_token()
+            if new_tok:
+                r2 = await client.get(
+                    f"{DATA_URL}{endpoint}", headers=_auth_headers(), params=params, timeout=10
+                )
+                d2 = r2.json()
+                if d2.get("s") == "ok":
+                    return d2
         logging.warning("Fyers %s returned: %s", endpoint, d.get("message", d))
     except Exception as e:
         logging.error("Fyers %s error: %s", endpoint, e)
     return None
 
 
-async def get_nifty_spot(client: httpx.AsyncClient) -> Optional[float]:
-    """Current NIFTY spot via Fyers quotes."""
-    d = await _fyers_get(client, "/quotes", {"symbols": "NSE:NIFTY50-INDEX"})
+async def get_index_spot(client: httpx.AsyncClient, instrument: str) -> Optional[float]:
+    """Current index spot for any instrument. d is a list, not a dict."""
+    sym = INSTRUMENT_CFG[instrument]["spot_symbol"]
+    d   = await _fyers_get(client, "/quotes", {"symbols": sym})
     if d:
-        q = (d.get("d") or {}).get("q", [])
-        if q:
-            return float(q[0]["v"]["lp"])
+        entries = d.get("d", [])
+        if entries and isinstance(entries, list):
+            return float(entries[0]["v"]["lp"])
     return None
 
 
-async def get_nifty_bars(client: httpx.AsyncClient,
+async def get_index_bars(client: httpx.AsyncClient,
+                         instrument: str,
                          from_dt: str, to_dt: str,
                          resolution: int = 1) -> List[dict]:
     """
-    Fetch NIFTY 1-min bars from Fyers history API.
+    Fetch 1-min bars for any index from Fyers history API.
     from_dt / to_dt: "YYYY-MM-DD HH:MM:SS" strings in IST.
     Returns list of {"t": epoch, "o": open, "h": high, "l": low, "c": close, "v": vol}.
     """
-    d = await _fyers_get(client, "/history", {
-        "symbol":      "NSE:NIFTY50-INDEX",
+    sym = INSTRUMENT_CFG[instrument]["bar_symbol"]
+    d   = await _fyers_get(client, "/history", {
+        "symbol":      sym,
         "resolution":  str(resolution),
         "date_format": "1",
         "range_from":  from_dt,
@@ -334,26 +371,28 @@ async def get_option_quotes(
         return None, None
 
     quotes_by_sym = {}
-    for q in (d.get("d") or {}).get("q", []):
+    for q in (d.get("d") or []):      # d is a list of {n, v, s} objects
         sym = q.get("n", "")
         v   = q.get("v", {})
         quotes_by_sym[sym] = {
-            "bid": float(v.get("bid_price", v.get("lp", 0))),
-            "ask": float(v.get("ask_price", v.get("lp", 0))),
+            "bid": float(v.get("bid", v.get("lp", 0))),
+            "ask": float(v.get("ask", v.get("lp", 0))),
             "ltp": float(v.get("lp", 0)),
         }
     return quotes_by_sym.get(sc_sym), quotes_by_sym.get(sp_sym)
 
 
-def _fyers_option_symbol(expiry_date: date, strike: float, is_call: bool) -> str:
+def _fyers_option_symbol(instrument: str, expiry_date: date,
+                          strike: float, is_call: bool) -> str:
     """
-    Build Fyers NSE option symbol.
-    Format: NSE:NIFTY{YY}{MON}{DD}{STRIKE}{CE/PE}
-    e.g.   NSE:NIFTY25JUL2424000CE
+    Build Fyers option symbol for any instrument.
+    NIFTY  → NSE:NIFTY25JUL0124000CE
+    SENSEX → BSE:SENSEX25JUL0380000CE
     """
-    exp = expiry_date.strftime("%y%b%d").upper()
+    prefix = INSTRUMENT_CFG[instrument]["fyers_prefix"]
+    exp    = expiry_date.strftime("%y%b%d").upper()
     suffix = "CE" if is_call else "PE"
-    return f"NSE:NIFTY{exp}{int(strike)}{suffix}"
+    return f"{prefix}{exp}{int(strike)}{suffix}"
 
 
 # ── Bar / chain builders ──────────────────────────────────────────────────────
@@ -553,6 +592,7 @@ class StrategyRunner:
     def __init__(
         self,
         name:        str,
+        instrument:  str,
         strategy:    ProductionThetaStrategy,
         trade_log:   str,
         mode:        str,
@@ -560,6 +600,8 @@ class StrategyRunner:
         live_router:  Optional[LiveOrderRouter] = None,
     ):
         self.name          = name
+        self.instrument    = instrument                          # "NIFTY" or "SENSEX"
+        self.lot_size      = INSTRUMENT_CFG[instrument]["lot_size"]
         self.strategy      = strategy
         self.trade_log     = trade_log
         self.mode          = mode
@@ -603,16 +645,16 @@ class StrategyRunner:
 
             self._trade_id  = str(uuid.uuid4())[:12]
             self._expiry    = today
-            self._sc_sym    = _fyers_option_symbol(today, ce_leg.strike, True)
-            self._sp_sym    = _fyers_option_symbol(today, pe_leg.strike, False)
+            self._sc_sym    = _fyers_option_symbol(self.instrument, today, ce_leg.strike, True)
+            self._sp_sym    = _fyers_option_symbol(self.instrument, today, pe_leg.strike, False)
             self._entry_time = bar.timestamp
 
             if self.mode == "paper":
-                ce_res = self._paper.sell(self._sc_sym, LOT_SIZE, ce_leg.limit_price)
-                pe_res = self._paper.sell(self._sp_sym, LOT_SIZE, pe_leg.limit_price)
+                ce_res = self._paper.sell(self._sc_sym, self.lot_size, ce_leg.limit_price)
+                pe_res = self._paper.sell(self._sp_sym, self.lot_size, pe_leg.limit_price)
             else:
-                ce_res = await self._live.sell(client, self._sc_sym, LOT_SIZE, ce_leg.limit_price)
-                pe_res = await self._live.sell(client, self._sp_sym, LOT_SIZE, pe_leg.limit_price)
+                ce_res = await self._live.sell(client, self._sc_sym, self.lot_size, ce_leg.limit_price)
+                pe_res = await self._live.sell(client, self._sp_sym, self.lot_size, pe_leg.limit_price)
 
             self._ce_order_id = ce_res["order_id"]
             self._pe_order_id = pe_res["order_id"]
@@ -680,16 +722,16 @@ class StrategyRunner:
 
             # Place close orders
             if self.mode == "paper":
-                ce_close = self._paper.buy(self._sc_sym, LOT_SIZE, ce_exit_price)
-                pe_close = self._paper.buy(self._sp_sym, LOT_SIZE, pe_exit_price)
+                ce_close = self._paper.buy(self._sc_sym, self.lot_size, ce_exit_price)
+                pe_close = self._paper.buy(self._sp_sym, self.lot_size, pe_exit_price)
             else:
-                ce_close = await self._live.buy(client, self._sc_sym, LOT_SIZE, ce_exit_price)
-                pe_close = await self._live.buy(client, self._sp_sym, LOT_SIZE, pe_exit_price)
+                ce_close = await self._live.buy(client, self._sc_sym, self.lot_size, ce_exit_price)
+                pe_close = await self._live.buy(client, self._sp_sym, self.lot_size, pe_exit_price)
 
             ce_close_fill = ce_close.get("fill_price", ce_exit_price)
             pe_close_fill = pe_close.get("fill_price", pe_exit_price)
 
-            pnl = (self._ce_fill + self._pe_fill - ce_close_fill - pe_close_fill) * LOT_SIZE
+            pnl = (self._ce_fill + self._pe_fill - ce_close_fill - pe_close_fill) * self.lot_size
             duration_min = int((bar.timestamp - self._entry_time).total_seconds() / 60)
 
             self.log.info(
@@ -729,32 +771,44 @@ class ThetaOrchestrator:
     def __init__(self, mode: str, log_dir: str, trades_dir: str) -> None:
         self.mode       = mode
         self.log        = logging.getLogger("theta.orch")
-        self.today      = date.today()
+        self.today      = datetime.now(IST).date()   # always IST, not server UTC
         self.trade_log  = _trade_log_path(trades_dir, self.today, mode)
         self._running   = True
 
-        cfg             = load_config()
-        chain_builder   = SyntheticChainBuilder(cfg.risk_free_rate)
-        paper_router    = PaperOrderRouter()
-        live_router     = LiveOrderRouter() if mode == "live" else None
+        cfg          = load_config()
+        paper_router = PaperOrderRouter()
+        live_router  = LiveOrderRouter() if mode == "live" else None
+
+        # Determine which instrument expires today (NIFTY=Tue, SENSEX=Thu)
+        wd = self.today.weekday()
+        self._active_instrument: Optional[str] = next(
+            (inst for inst, icfg in INSTRUMENT_CFG.items()
+             if icfg["expiry_weekday"] == wd), None
+        )
 
         self._runners: List[StrategyRunner] = []
-        for name, params in STRATEGIES.items():
-            strat = ProductionThetaStrategy(
-                Instrument(INSTRUMENT), cfg,
-                quantity         = LOTS,
-                otm_sigma_mult   = 0.30,
-                **params,
-            )
-            self._runners.append(StrategyRunner(
-                name=name, strategy=strat,
-                trade_log=self.trade_log, mode=mode,
-                paper_router=paper_router, live_router=live_router,
-            ))
+        if self._active_instrument:
+            for name, params in STRATEGIES.items():
+                inst = params["instrument"]
+                if inst != self._active_instrument:
+                    continue
+                strat_params = {k: v for k, v in params.items() if k != "instrument"}
+                strat = ProductionThetaStrategy(
+                    Instrument(inst), cfg,
+                    quantity       = LOTS,
+                    otm_sigma_mult = 0.30,
+                    **strat_params,
+                )
+                self._runners.append(StrategyRunner(
+                    name=name, instrument=inst, strategy=strat,
+                    trade_log=self.trade_log, mode=mode,
+                    paper_router=paper_router, live_router=live_router,
+                ))
 
-        self._chain_builder = chain_builder
-        self._bars_hist: List[dict] = []
-        self._vix: float = 14.0
+        self._chain_builder   = SyntheticChainBuilder(cfg.risk_free_rate)
+        self._bars_hist:      List[dict] = []
+        self._vix:            float = 14.0
+        self._morning_loaded: bool  = False
 
     def _in_trading_window(self) -> bool:
         now = datetime.now(IST).time()
@@ -762,16 +816,15 @@ class ThetaOrchestrator:
         return dtime(9, 0) <= now <= dtime(15, 30)
 
     def _is_expiry_day(self) -> bool:
-        """Only run on Thursdays (NIFTY expiry day = weekday 3)."""
-        return self.today.weekday() == LOT_SIZES[INSTRUMENT].expiry_weekday
+        return self._active_instrument is not None
 
     async def _load_morning_range_and_history(self, client: httpx.AsyncClient) -> None:
-        """Fetch 9:15–13:00 bars for morning range and feature computation."""
-        self.log.info("Loading morning bars for morning-range computation...")
+        self.log.info("Loading morning bars for %s...", self._active_instrument)
         today_str = self.today.strftime("%Y-%m-%d")
-        bars = await get_nifty_bars(client,
-                                    f"{today_str} 09:15:00",
-                                    f"{today_str} 12:59:00")
+        bars = await get_index_bars(
+            client, self._active_instrument,
+            f"{today_str} 09:15:00", f"{today_str} 12:59:00"
+        )
         if bars:
             self._bars_hist = bars
             h = max(b["h"] for b in bars)
@@ -786,13 +839,19 @@ class ThetaOrchestrator:
         signal.signal(signal.SIGTERM, lambda s, f: setattr(self, "_running", False))
 
         if not self._is_expiry_day():
-            self.log.info("Today (%s, weekday=%d) is not NIFTY expiry Thursday — exiting.",
-                          self.today, self.today.weekday())
+            wd_map = {0:"Mon",1:"Tue",2:"Wed",3:"Thu",4:"Fri",5:"Sat",6:"Sun"}
+            self.log.info(
+                "Today (%s, %s) — no instrument expires today. "
+                "NIFTY=Tue, SENSEX=Thu. Exiting.",
+                self.today, wd_map.get(self.today.weekday(), "?")
+            )
             return
 
+        active_names = [r.name for r in self._runners]
         self.log.info("=" * 60)
-        self.log.info("ProductionTheta %s MODE — %s", self.mode.upper(), self.today)
-        self.log.info("Strategies: %s", list(STRATEGIES.keys()))
+        self.log.info("ProductionTheta %s MODE — %s | Instrument: %s",
+                      self.mode.upper(), self.today, self._active_instrument)
+        self.log.info("Active strategies: %s", active_names)
         self.log.info("Poll interval: %ds", POLL_SECS)
         self.log.info("=" * 60)
 
@@ -800,7 +859,8 @@ class ThetaOrchestrator:
             "event":      "session_start",
             "date":       str(self.today),
             "mode":       self.mode,
-            "strategies": list(STRATEGIES.keys()),
+            "instrument": self._active_instrument,
+            "strategies": active_names,
         })
 
         # ── Ensure we have a valid Fyers token before doing anything ──────────
@@ -814,8 +874,9 @@ class ThetaOrchestrator:
             return
 
         async with httpx.AsyncClient() as client:
-            # Load morning range at startup or when entering trading window
+            # Attempt morning range load at startup (succeeds only if market already open)
             await self._load_morning_range_and_history(client)
+            self._morning_loaded = len(self._bars_hist) > 0
 
             # Reset all strategies for the new session
             for r in self._runners:
@@ -825,24 +886,33 @@ class ThetaOrchestrator:
                 now = datetime.now(IST)
 
                 if not self._in_trading_window():
-                    if now.hour >= 15 and now.minute >= 30:
+                    from datetime import time as dtime
+                    if datetime.now(IST).time() >= dtime(15, 30):
                         self.log.info("Market closed. Session done.")
                         break
                     await asyncio.sleep(60)
                     continue
 
+                # Re-load morning range once market has been open for a bit
+                now_t = datetime.now(IST).time()
+                from datetime import time as dtime
+                if not self._morning_loaded and now_t >= dtime(9, 20):
+                    await self._load_morning_range_and_history(client)
+                    self._morning_loaded = len(self._bars_hist) > 0
+
                 # Fetch live data
-                spot = await get_nifty_spot(client)
+                spot = await get_index_spot(client, self._active_instrument)
                 if spot is None:
-                    self.log.warning("Could not fetch NIFTY spot — skipping tick")
+                    self.log.warning("Could not fetch %s spot — skipping tick",
+                                     self._active_instrument)
                     await asyncio.sleep(POLL_SECS)
                     continue
 
                 # Get latest 1-min bar (last completed bar = request last 5 mins)
                 today_str = self.today.strftime("%Y-%m-%d")
                 ts_from = (now - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S")
-                recent = await get_nifty_bars(client, ts_from,
-                                              now.strftime("%Y-%m-%d %H:%M:%S"))
+                recent = await get_index_bars(client, self._active_instrument,
+                                              ts_from, now.strftime("%Y-%m-%d %H:%M:%S"))
                 if recent:
                     # Add to history and deduplicate by timestamp
                     existing_ts = {b["t"] for b in self._bars_hist}
@@ -858,7 +928,7 @@ class ThetaOrchestrator:
 
                 # Build chain (synthetic base + real quotes for traded strikes if available)
                 chain = self._chain_builder.build(
-                    instrument = INSTRUMENT,
+                    instrument = self._active_instrument,
                     spot       = spot,
                     timestamp  = now,
                     atm_iv     = self._vix / 100.0,
@@ -889,7 +959,8 @@ class ThetaOrchestrator:
 
                 # Status line (replaces stdout every poll)
                 in_trade = sum(1 for r in self._runners if r.strategy._in_trade)
-                print(f"\r  {now.strftime('%H:%M:%S')}  NIFTY={spot:.0f}  "
+                print(f"\r  {now.strftime('%H:%M:%S')}  "
+                      f"{self._active_instrument}={spot:.0f}  "
                       f"in_trade={in_trade}/{len(self._runners)}  "
                       f"mode={self.mode}  ", end="", flush=True)
 
@@ -911,13 +982,18 @@ def main() -> None:
     p.add_argument("--trades-dir", default="trades")
     args = p.parse_args()
 
-    today = date.today()
+    today = datetime.now(IST).date()   # IST date, not UTC
     log   = _setup_logging(args.log_dir, today)
 
     if args.dry_run:
         print("\nProductionTheta DRY RUN")
-        print(f"  Today    : {today} (weekday={today.weekday()}, "
-              f"Thursday={'YES' if today.weekday()==3 else 'NO'})")
+        wd_names  = {0:"Mon",1:"Tue",2:"Wed",3:"Thu",4:"Fri"}
+        today_wd  = today.weekday()
+        active    = next((inst for inst, icfg in INSTRUMENT_CFG.items()
+                          if icfg["expiry_weekday"] == today_wd), None)
+        print(f"  Today      : {today} ({wd_names.get(today_wd,'?')})")
+        print(f"  Will trade : {active if active else 'NONE (no expiry today)'}  "
+              f"[NIFTY=Tue | SENSEX=Thu]")
         print(f"  App ID   : {APP_ID[:8]}..." if APP_ID else "  App ID   : NOT SET")
         print(f"  Token    : {'SET' if TOKEN else 'NOT SET'}")
         print()
